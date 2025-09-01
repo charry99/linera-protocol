@@ -3,8 +3,8 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    num::NonZeroUsize,
     sync::Arc,
+    time::Duration,
     vec,
 };
 
@@ -15,9 +15,10 @@ use futures::{
     Future,
 };
 use linera_base::{
-    crypto::*,
+    crypto::{AccountPublicKey, CryptoHash, InMemorySigner, ValidatorKeypair, ValidatorPublicKey},
     data_types::*,
-    identifiers::{BlobId, ChainDescription, ChainId},
+    identifiers::{AccountOwner, BlobId, ChainId},
+    ownership::ChainOwnership,
 };
 use linera_chain::{
     data_types::BlockProposal,
@@ -26,38 +27,34 @@ use linera_chain::{
         LiteCertificate, Timeout, ValidatedBlock,
     },
 };
-use linera_execution::{
-    committee::{Committee, ValidatorName},
-    ResourceControlPolicy, WasmRuntime,
-};
-use linera_storage::{DbStorage, Storage, TestClock};
+use linera_execution::{committee::Committee, ResourceControlPolicy, WasmRuntime};
+use linera_storage::{DbStorage, ResultReadCertificates, Storage, TestClock};
 #[cfg(all(not(target_arch = "wasm32"), feature = "storage-service"))]
-use linera_storage_service::client::ServiceStoreClient;
+use linera_storage_service::client::StorageServiceDatabase;
 use linera_version::VersionInfo;
 #[cfg(feature = "dynamodb")]
-use linera_views::dynamo_db::DynamoDbStore;
+use linera_views::dynamo_db::DynamoDbDatabase;
 #[cfg(feature = "scylladb")]
-use linera_views::scylla_db::ScyllaDbStore;
+use linera_views::scylla_db::ScyllaDbDatabase;
 use linera_views::{
-    memory::MemoryStore, random::generate_test_namespace, store::TestKeyValueStore as _,
+    memory::MemoryDatabase, random::generate_test_namespace, store::TestKeyValueDatabase as _,
 };
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 #[cfg(feature = "rocksdb")]
 use {
-    linera_views::rocks_db::RocksDbStore,
+    linera_views::rocks_db::RocksDbDatabase,
     tokio::sync::{Semaphore, SemaphorePermit},
 };
 
 use crate::{
-    client::{ChainClient, Client},
+    client::{ChainClientOptions, Client},
     data_types::*,
     node::{
         CrossChainMessageDelivery, NodeError, NotificationStream, ValidatorNode,
         ValidatorNodeProvider,
     },
     notifier::ChannelNotifier,
-    updater::DEFAULT_GRACE_PERIOD,
     worker::{NetworkActions, Notification, ProcessableCertificate, WorkerState},
 };
 
@@ -92,7 +89,7 @@ pub struct LocalValidatorClient<S>
 where
     S: Storage,
 {
-    name: ValidatorName,
+    public_key: ValidatorPublicKey,
     client: Arc<Mutex<LocalValidator<S>>>,
 }
 
@@ -174,8 +171,19 @@ where
         Ok(Default::default())
     }
 
-    async fn get_genesis_config_hash(&self) -> Result<CryptoHash, NodeError> {
-        Ok(CryptoHash::test_hash("genesis config"))
+    async fn get_network_description(&self) -> Result<NetworkDescription, NodeError> {
+        Ok(self
+            .client
+            .lock()
+            .await
+            .state
+            .storage_client()
+            .read_network_description()
+            .await
+            .transpose()
+            .ok_or(NodeError::ViewError {
+                error: "missing NetworkDescription".to_owned(),
+            })??)
     }
 
     async fn upload_blob(&self, content: BlobContent) -> Result<BlobId, NodeError> {
@@ -218,7 +226,6 @@ where
             validator.do_download_certificate(hash, sender)
         })
         .await
-        .map(Into::into)
     }
 
     async fn download_certificates(
@@ -231,9 +238,30 @@ where
         .await
     }
 
+    async fn download_certificates_by_heights(
+        &self,
+        chain_id: ChainId,
+        heights: Vec<BlockHeight>,
+    ) -> Result<Vec<ConfirmedBlockCertificate>, NodeError> {
+        self.spawn_and_receive(move |validator, sender| {
+            validator.do_download_certificates_by_heights(chain_id, heights, sender)
+        })
+        .await
+    }
+
     async fn blob_last_used_by(&self, blob_id: BlobId) -> Result<CryptoHash, NodeError> {
         self.spawn_and_receive(move |validator, sender| {
             validator.do_blob_last_used_by(blob_id, sender)
+        })
+        .await
+    }
+
+    async fn blob_last_used_by_certificate(
+        &self,
+        blob_id: BlobId,
+    ) -> Result<ConfirmedBlockCertificate, NodeError> {
+        self.spawn_and_receive(move |validator, sender| {
+            validator.do_blob_last_used_by_certificate(blob_id, sender)
         })
         .await
     }
@@ -250,20 +278,20 @@ impl<S> LocalValidatorClient<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    fn new(name: ValidatorName, state: WorkerState<S>) -> Self {
+    fn new(public_key: ValidatorPublicKey, state: WorkerState<S>) -> Self {
         let client = LocalValidator {
             fault_type: FaultType::Honest,
             state,
             notifier: Arc::new(ChannelNotifier::default()),
         };
         Self {
-            name,
+            public_key,
             client: Arc::new(Mutex::new(client)),
         }
     }
 
-    pub fn name(&self) -> ValidatorName {
-        self.name
+    pub fn name(&self) -> ValidatorPublicKey {
+        self.public_key
     }
 
     async fn set_fault_type(&self, fault_type: FaultType) {
@@ -500,6 +528,10 @@ where
             .read_blob(blob_id)
             .await
             .map_err(Into::into);
+        let blob = match blob {
+            Ok(blob) => blob.ok_or(NodeError::BlobsNotFound(vec![blob_id])),
+            Err(error) => Err(error),
+        };
         sender.send(blob.map(|blob| blob.into_content()))
     }
 
@@ -546,6 +578,16 @@ where
             .await
             .map_err(Into::into);
 
+        let certificate = match certificate {
+            Err(error) => Err(error),
+            Ok(entry) => match entry {
+                Some(certificate) => Ok(certificate),
+                None => {
+                    panic!("Missing certificate: {hash}");
+                }
+            },
+        };
+
         sender.send(certificate)
     }
 
@@ -558,11 +600,66 @@ where
         let certificates = validator
             .state
             .storage_client()
-            .read_certificates(hashes)
+            .read_certificates(hashes.clone())
             .await
             .map_err(Into::into);
 
+        let certificates = match certificates {
+            Err(error) => Err(error),
+            Ok(certificates) => match ResultReadCertificates::new(certificates, hashes) {
+                ResultReadCertificates::Certificates(certificates) => Ok(certificates),
+                ResultReadCertificates::InvalidHashes(hashes) => {
+                    panic!("Missing certificates: {:?}", hashes)
+                }
+            },
+        };
+
         sender.send(certificates)
+    }
+
+    async fn do_download_certificates_by_heights(
+        self,
+        chain_id: ChainId,
+        heights: Vec<BlockHeight>,
+        sender: oneshot::Sender<Result<Vec<ConfirmedBlockCertificate>, NodeError>>,
+    ) -> Result<(), Result<Vec<ConfirmedBlockCertificate>, NodeError>> {
+        // First, use do_handle_chain_info_query to get the certificate hashes
+        let (query_sender, query_receiver) = oneshot::channel();
+        let query = ChainInfoQuery::new(chain_id).with_sent_certificate_hashes_by_heights(heights);
+
+        let self_clone = self.clone();
+        self.do_handle_chain_info_query(query, query_sender)
+            .await
+            .expect("Failed to handle chain info query");
+
+        // Get the response from the chain info query
+        let chain_info_response = query_receiver.await.map_err(|_| {
+            Err(NodeError::ClientIoError {
+                error: "Failed to receive chain info response".to_string(),
+            })
+        })?;
+
+        let hashes = match chain_info_response {
+            Ok(response) => response.info.requested_sent_certificate_hashes,
+            Err(e) => {
+                return sender.send(Err(e));
+            }
+        };
+
+        // Now use do_download_certificates to get the actual certificates
+        let (cert_sender, cert_receiver) = oneshot::channel();
+        self_clone
+            .do_download_certificates(hashes, cert_sender)
+            .await?;
+
+        // Forward the result to the original sender
+        let result = cert_receiver.await.map_err(|_| {
+            Err(NodeError::ClientIoError {
+                error: "Failed to receive certificates".to_string(),
+            })
+        })?;
+
+        sender.send(result)
     }
 
     async fn do_blob_last_used_by(
@@ -571,15 +668,37 @@ where
         sender: oneshot::Sender<Result<CryptoHash, NodeError>>,
     ) -> Result<(), Result<CryptoHash, NodeError>> {
         let validator = self.client.lock().await;
-        let certificate_hash = validator
+        let blob_state = validator
             .state
             .storage_client()
             .read_blob_state(blob_id)
             .await
-            .map(|blob_state| blob_state.last_used_by)
             .map_err(Into::into);
+        let certificate_hash = match blob_state {
+            Err(err) => Err(err),
+            Ok(blob_state) => match blob_state {
+                None => Err(NodeError::BlobsNotFound(vec![blob_id])),
+                Some(blob_state) => blob_state
+                    .last_used_by
+                    .ok_or_else(|| NodeError::BlobsNotFound(vec![blob_id])),
+            },
+        };
 
         sender.send(certificate_hash)
+    }
+
+    async fn do_blob_last_used_by_certificate(
+        self,
+        blob_id: BlobId,
+        sender: oneshot::Sender<Result<ConfirmedBlockCertificate, NodeError>>,
+    ) -> Result<(), Result<ConfirmedBlockCertificate, NodeError>> {
+        match self.blob_last_used_by(blob_id).await {
+            Ok(cert_hash) => {
+                let cert = self.download_certificate(cert_hash).await;
+                sender.send(cert)
+            }
+            Err(err) => sender.send(Err(err)),
+        }
     }
 
     async fn do_missing_blob_ids(
@@ -599,7 +718,7 @@ where
 }
 
 #[derive(Clone)]
-pub struct NodeProvider<S>(BTreeMap<ValidatorName, Arc<Mutex<LocalValidator<S>>>>)
+pub struct NodeProvider<S>(BTreeMap<ValidatorPublicKey, Arc<Mutex<LocalValidator<S>>>>)
 where
     S: Storage;
 
@@ -615,21 +734,21 @@ where
 
     fn make_nodes_from_list<A>(
         &self,
-        validators: impl IntoIterator<Item = (ValidatorName, A)>,
-    ) -> Result<impl Iterator<Item = (ValidatorName, Self::Node)>, NodeError>
+        validators: impl IntoIterator<Item = (ValidatorPublicKey, A)>,
+    ) -> Result<impl Iterator<Item = (ValidatorPublicKey, Self::Node)>, NodeError>
     where
         A: AsRef<str>,
     {
         Ok(validators
             .into_iter()
-            .map(|(name, address)| {
+            .map(|(public_key, address)| {
                 self.0
-                    .get(&name)
+                    .get(&public_key)
                     .ok_or_else(|| NodeError::CannotResolveValidatorAddress {
                         address: address.as_ref().to_string(),
                     })
                     .cloned()
-                    .map(|client| (name, LocalValidatorClient { name, client }))
+                    .map(|client| (public_key, LocalValidatorClient { public_key, client }))
             })
             .collect::<Result<Vec<_>, _>>()?
             .into_iter())
@@ -644,7 +763,8 @@ where
     where
         T: IntoIterator<Item = LocalValidatorClient<S>>,
     {
-        let destructure = |validator: LocalValidatorClient<S>| (validator.name, validator.client);
+        let destructure =
+            |validator: LocalValidatorClient<S>| (validator.public_key, validator.client);
         Self(iter.into_iter().map(destructure).collect())
     }
 }
@@ -655,14 +775,18 @@ where
 // * When using `LocalValidatorClient`, clients communicate with an exact quorum then stop.
 // * Most tests have 1 faulty validator out 4 so that there is exactly only 1 quorum to
 // communicate with.
+#[allow(dead_code)]
 pub struct TestBuilder<B: StorageBuilder> {
     storage_builder: B,
     pub initial_committee: Committee,
-    admin_id: ChainId,
+    admin_description: Option<ChainDescription>,
+    network_description: Option<NetworkDescription>,
     genesis_storage_builder: GenesisStorageBuilder,
     validator_clients: Vec<LocalValidatorClient<B::Storage>>,
-    validator_storages: HashMap<ValidatorName, B::Storage>,
+    validator_storages: HashMap<ValidatorPublicKey, B::Storage>,
     chain_client_storages: Vec<B::Storage>,
+    pub chain_owners: BTreeMap<ChainId, AccountOwner>,
+    pub signer: InMemorySigner,
 }
 
 #[async_trait]
@@ -681,37 +805,52 @@ struct GenesisStorageBuilder {
 
 struct GenesisAccount {
     description: ChainDescription,
-    public_key: PublicKey,
-    balance: Amount,
+    public_key: AccountPublicKey,
 }
 
 impl GenesisStorageBuilder {
-    fn add(&mut self, description: ChainDescription, public_key: PublicKey, balance: Amount) {
+    fn add(&mut self, description: ChainDescription, public_key: AccountPublicKey) {
         self.accounts.push(GenesisAccount {
             description,
             public_key,
-            balance,
         })
     }
 
-    async fn build<S>(&self, storage: S, initial_committee: Committee, admin_id: ChainId) -> S
+    async fn build<S>(&self, storage: S) -> S
     where
         S: Storage + Clone + Send + Sync + 'static,
     {
         for account in &self.accounts {
             storage
-                .create_chain(
-                    initial_committee.clone(),
-                    admin_id,
-                    account.description,
-                    account.public_key.into(),
-                    account.balance,
-                    Timestamp::from(0),
-                )
+                .create_chain(account.description.clone())
                 .await
                 .unwrap();
         }
         storage
+    }
+}
+
+pub type ChainClient<S> =
+    crate::client::ChainClient<crate::environment::Impl<S, NodeProvider<S>, InMemorySigner>>;
+
+impl<S: Storage + Clone + Send + Sync + 'static> ChainClient<S> {
+    /// Reads the hashed certificate values in descending order from the given hash.
+    pub async fn read_confirmed_blocks_downward(
+        &self,
+        from: CryptoHash,
+        limit: u32,
+    ) -> anyhow::Result<Vec<ConfirmedBlock>> {
+        let mut hash = Some(from);
+        let mut values = Vec::new();
+        for _ in 0..limit {
+            let Some(next_hash) = hash else {
+                break;
+            };
+            let value = self.read_confirmed_block(next_hash).await?;
+            hash = value.block().header.previous_block_hash;
+            values.push(value);
+        }
+        Ok(values)
     }
 }
 
@@ -723,37 +862,39 @@ where
         mut storage_builder: B,
         count: usize,
         with_faulty_validators: usize,
+        mut signer: InMemorySigner,
     ) -> Result<Self, anyhow::Error> {
-        let mut key_pairs = Vec::new();
         let mut validators = Vec::new();
         for _ in 0..count {
-            let key_pair = KeyPair::generate();
-            let name = ValidatorName(key_pair.public());
-            validators.push(name);
-            key_pairs.push(key_pair);
+            let validator_keypair = ValidatorKeypair::generate();
+            let account_public_key = signer.generate_new();
+            validators.push((validator_keypair, account_public_key));
         }
-        let initial_committee = Committee::make_simple(validators);
+        let for_committee = validators
+            .iter()
+            .map(|(validating, account)| (validating.public_key, *account))
+            .collect::<Vec<_>>();
+        let initial_committee = Committee::make_simple(for_committee);
         let mut validator_clients = Vec::new();
         let mut validator_storages = HashMap::new();
         let mut faulty_validators = HashSet::new();
-        for (i, key_pair) in key_pairs.into_iter().enumerate() {
-            let name = ValidatorName(key_pair.public());
+        for (i, (validator_keypair, _account_public_key)) in validators.into_iter().enumerate() {
+            let validator_public_key = validator_keypair.public_key;
             let storage = storage_builder.build().await?;
             let state = WorkerState::new(
                 format!("Node {}", i),
-                Some(key_pair),
+                Some(validator_keypair.secret_key),
                 storage.clone(),
-                NonZeroUsize::new(100).expect("Chain worker limit should not be zero"),
             )
             .with_allow_inactive_chains(false)
             .with_allow_messages_from_deprecated_epochs(false);
-            let validator = LocalValidatorClient::new(name, state);
+            let validator = LocalValidatorClient::new(validator_public_key, state);
             if i < with_faulty_validators {
-                faulty_validators.insert(name);
+                faulty_validators.insert(validator_public_key);
                 validator.set_fault_type(FaultType::Malicious).await;
             }
             validator_clients.push(validator);
-            validator_storages.insert(name, storage);
+            validator_storages.insert(validator_public_key, storage);
         }
         tracing::info!(
             "Test will use the following faulty validators: {:?}",
@@ -762,11 +903,14 @@ where
         Ok(Self {
             storage_builder,
             initial_committee,
-            admin_id: ChainId::root(0),
+            admin_description: None,
+            network_description: None,
             genesis_storage_builder: GenesisStorageBuilder::default(),
             validator_clients,
             validator_storages,
             chain_client_storages: Vec::new(),
+            chain_owners: BTreeMap::new(),
+            signer,
         })
     }
 
@@ -781,7 +925,7 @@ where
         for index in indexes.as_ref() {
             let validator = &mut self.validator_clients[*index];
             validator.set_fault_type(fault_type).await;
-            faulty_validators.push(validator.name);
+            faulty_validators.push(validator.public_key);
         }
         tracing::info!(
             "Making the following validators {:?}: {:?}",
@@ -791,76 +935,106 @@ where
     }
 
     /// Creates the root chain with the given `index`, and returns a client for it.
+    ///
+    /// Root chain 0 is the admin chain and needs to be initialized first, otherwise its balance
+    /// is automatically set to zero.
     pub async fn add_root_chain(
         &mut self,
         index: u32,
         balance: Amount,
-    ) -> Result<ChainClient<NodeProvider<B::Storage>, B::Storage>, anyhow::Error> {
-        let description = ChainDescription::Root(index);
-        let key_pair = KeyPair::generate();
-        let public_key = key_pair.public();
+    ) -> anyhow::Result<ChainClient<B::Storage>> {
+        // Make sure the admin chain is initialized.
+        if self.admin_description.is_none() && index != 0 {
+            Box::pin(self.add_root_chain(0, Amount::ZERO)).await?;
+        }
+        let origin = ChainOrigin::Root(index);
+        let public_key = self.signer.generate_new();
+        let open_chain_config = InitialChainConfig {
+            ownership: ChainOwnership::single(public_key.into()),
+            epoch: Epoch(0),
+            min_active_epoch: Epoch(0),
+            max_active_epoch: Epoch(0),
+            balance,
+            application_permissions: ApplicationPermissions::default(),
+        };
+        let description = ChainDescription::new(origin, open_chain_config, Timestamp::from(0));
+        let committee_blob = Blob::new_committee(bcs::to_bytes(&self.initial_committee).unwrap());
+        if index == 0 {
+            self.admin_description = Some(description.clone());
+            self.network_description = Some(NetworkDescription {
+                admin_chain_id: description.id(),
+                // dummy values to fill the description
+                genesis_config_hash: CryptoHash::test_hash("genesis config"),
+                genesis_timestamp: Timestamp::from(0),
+                genesis_committee_blob_hash: committee_blob.id().hash,
+                name: "test network".to_string(),
+            });
+        }
         // Remember what's in the genesis store for future clients to join.
         self.genesis_storage_builder
-            .add(description, public_key, balance);
+            .add(description.clone(), public_key);
+
+        let network_description = self.network_description.as_ref().unwrap();
+
         for validator in &self.validator_clients {
-            let storage = self.validator_storages.get_mut(&validator.name).unwrap();
+            let storage = self
+                .validator_storages
+                .get_mut(&validator.public_key)
+                .unwrap();
+            storage
+                .write_network_description(network_description)
+                .await
+                .expect("writing the NetworkDescription should succeed");
+            storage
+                .write_blob(&committee_blob)
+                .await
+                .expect("writing a blob should succeed");
             if validator.fault_type().await == FaultType::Malicious {
+                let origin = description.origin();
+                let config = InitialChainConfig {
+                    balance: Amount::ZERO,
+                    ..description.config().clone()
+                };
                 storage
-                    .create_chain(
-                        self.initial_committee.clone(),
-                        self.admin_id,
-                        description,
-                        public_key.into(),
-                        Amount::ZERO,
-                        Timestamp::from(0),
-                    )
+                    .create_chain(ChainDescription::new(origin, config, Timestamp::from(0)))
                     .await
                     .unwrap();
             } else {
-                storage
-                    .create_chain(
-                        self.initial_committee.clone(),
-                        self.admin_id,
-                        description,
-                        public_key.into(),
-                        balance,
-                        Timestamp::from(0),
-                    )
-                    .await
-                    .unwrap();
+                storage.create_chain(description.clone()).await.unwrap();
             }
         }
         for storage in self.chain_client_storages.iter_mut() {
-            storage
-                .create_chain(
-                    self.initial_committee.clone(),
-                    self.admin_id,
-                    description,
-                    public_key.into(),
-                    balance,
-                    Timestamp::from(0),
-                )
-                .await
-                .unwrap();
+            storage.create_chain(description.clone()).await.unwrap();
         }
-        self.make_client(description.into(), key_pair, None, BlockHeight::ZERO)
-            .await
+        let chain_id = description.id();
+        self.chain_owners.insert(chain_id, public_key.into());
+        self.make_client(chain_id, None, BlockHeight::ZERO).await
     }
 
-    pub fn genesis_chains(&self) -> Vec<(PublicKey, Amount)> {
+    pub fn genesis_chains(&self) -> Vec<(AccountPublicKey, Amount)> {
         let mut result = Vec::new();
         for (i, genesis_account) in self.genesis_storage_builder.accounts.iter().enumerate() {
             assert_eq!(
-                genesis_account.description,
-                ChainDescription::Root(i as u32)
+                genesis_account.description.origin(),
+                ChainOrigin::Root(i as u32)
             );
-            result.push((genesis_account.public_key, genesis_account.balance));
+            result.push((
+                genesis_account.public_key,
+                genesis_account.description.config().balance,
+            ));
         }
         result
     }
 
     pub fn admin_id(&self) -> ChainId {
-        self.admin_id
+        self.admin_description
+            .as_ref()
+            .expect("admin chain not initialized")
+            .id()
+    }
+
+    pub fn admin_description(&self) -> Option<&ChainDescription> {
+        self.admin_description.as_ref()
     }
 
     pub fn make_node_provider(&self) -> NodeProvider<B::Storage> {
@@ -872,48 +1046,50 @@ where
     }
 
     pub async fn make_storage(&mut self) -> anyhow::Result<B::Storage> {
-        Ok(self
-            .genesis_storage_builder
-            .build(
-                self.storage_builder.build().await?,
-                self.initial_committee.clone(),
-                self.admin_id,
-            )
-            .await)
+        let storage = self.storage_builder.build().await?;
+        let network_description = self.network_description.as_ref().unwrap();
+        let committee_blob = Blob::new_committee(bcs::to_bytes(&self.initial_committee).unwrap());
+        storage
+            .write_network_description(network_description)
+            .await
+            .expect("writing the NetworkDescription should succeed");
+        storage
+            .write_blob(&committee_blob)
+            .await
+            .expect("writing a blob should succeed");
+        Ok(self.genesis_storage_builder.build(storage).await)
     }
 
     pub async fn make_client(
         &mut self,
         chain_id: ChainId,
-        key_pair: KeyPair,
         block_hash: Option<CryptoHash>,
         block_height: BlockHeight,
-    ) -> Result<ChainClient<NodeProvider<B::Storage>, B::Storage>, anyhow::Error> {
+    ) -> anyhow::Result<ChainClient<B::Storage>> {
         // Note that new clients are only given the genesis store: they must figure out
         // the rest by asking validators.
         let storage = self.make_storage().await?;
         self.chain_client_storages.push(storage.clone());
-        let provider = self.make_node_provider();
-        let builder = Arc::new(Client::new(
-            provider,
-            storage,
-            10,
-            CrossChainMessageDelivery::NonBlocking,
+        let client = Arc::new(Client::new(
+            crate::environment::Impl {
+                network: self.make_node_provider(),
+                storage,
+                signer: self.signer.clone(),
+            },
+            self.admin_id(),
             false,
             [chain_id],
             format!("Client node for {:.8}", chain_id),
-            NonZeroUsize::new(20).expect("Chain worker limit should not be zero"),
-            DEFAULT_GRACE_PERIOD,
+            Duration::from_secs(30),
+            ChainClientOptions::test_default(),
         ));
-        Ok(builder.create_chain_client(
+        Ok(client.create_chain_client(
             chain_id,
-            vec![key_pair],
-            self.admin_id,
             block_hash,
-            Timestamp::from(0),
             block_height,
             None,
-            BTreeMap::new(),
+            self.chain_owners.get(&chain_id).copied(),
+            None,
         ))
     }
 
@@ -924,16 +1100,13 @@ where
         block_height: BlockHeight,
         target_count: usize,
     ) -> Option<ConfirmedBlockCertificate> {
-        let query =
-            ChainInfoQuery::new(chain_id).with_sent_certificate_hashes_in_range(BlockHeightRange {
-                start: block_height,
-                limit: Some(1),
-            });
+        let query = ChainInfoQuery::new(chain_id)
+            .with_sent_certificate_hashes_by_heights(vec![block_height]);
         let mut count = 0;
         let mut certificate = None;
         for validator in self.validator_clients.clone() {
             if let Ok(response) = validator.handle_chain_info_query(query.clone()).await {
-                if response.check(&validator.name).is_ok() {
+                if response.check(validator.public_key).is_ok() {
                     let ChainInfo {
                         mut requested_sent_certificate_hashes,
                         ..
@@ -972,7 +1145,7 @@ where
             if let Ok(response) = validator.handle_chain_info_query(query.clone()).await {
                 if response.info.manager.current_round == round
                     && response.info.next_block_height == block_height
-                    && response.check(&validator.name).is_ok()
+                    && response.check(validator.public_key).is_ok()
                 {
                     count += 1;
                 }
@@ -1005,24 +1178,19 @@ pub struct MemoryStorageBuilder {
 
 #[async_trait]
 impl StorageBuilder for MemoryStorageBuilder {
-    type Storage = DbStorage<MemoryStore, TestClock>;
+    type Storage = DbStorage<MemoryDatabase, TestClock>;
 
     async fn build(&mut self) -> Result<Self::Storage, anyhow::Error> {
         self.instance_counter += 1;
-        let config = MemoryStore::new_test_config().await?;
+        let config = MemoryDatabase::new_test_config().await?;
         if self.namespace.is_empty() {
             self.namespace = generate_test_namespace();
         }
         let namespace = format!("{}_{}", self.namespace, self.instance_counter);
-        let root_key = &[];
-        Ok(DbStorage::new_for_testing(
-            config,
-            &namespace,
-            root_key,
-            self.wasm_runtime,
-            self.clock.clone(),
+        Ok(
+            DbStorage::new_for_testing(config, &namespace, self.wasm_runtime, self.clock.clone())
+                .await?,
         )
-        .await?)
     }
 
     fn clock(&self) -> &TestClock {
@@ -1077,24 +1245,19 @@ impl RocksDbStorageBuilder {
 #[cfg(feature = "rocksdb")]
 #[async_trait]
 impl StorageBuilder for RocksDbStorageBuilder {
-    type Storage = DbStorage<RocksDbStore, TestClock>;
+    type Storage = DbStorage<RocksDbDatabase, TestClock>;
 
     async fn build(&mut self) -> Result<Self::Storage, anyhow::Error> {
         self.instance_counter += 1;
-        let config = RocksDbStore::new_test_config().await?;
+        let config = RocksDbDatabase::new_test_config().await?;
         if self.namespace.is_empty() {
             self.namespace = generate_test_namespace();
         }
         let namespace = format!("{}_{}", self.namespace, self.instance_counter);
-        let root_key = &[];
-        Ok(DbStorage::new_for_testing(
-            config,
-            &namespace,
-            root_key,
-            self.wasm_runtime,
-            self.clock.clone(),
+        Ok(
+            DbStorage::new_for_testing(config, &namespace, self.wasm_runtime, self.clock.clone())
+                .await?,
         )
-        .await?)
     }
 
     fn clock(&self) -> &TestClock {
@@ -1130,24 +1293,19 @@ impl ServiceStorageBuilder {
 #[cfg(all(not(target_arch = "wasm32"), feature = "storage-service"))]
 #[async_trait]
 impl StorageBuilder for ServiceStorageBuilder {
-    type Storage = DbStorage<ServiceStoreClient, TestClock>;
+    type Storage = DbStorage<StorageServiceDatabase, TestClock>;
 
     async fn build(&mut self) -> anyhow::Result<Self::Storage> {
         self.instance_counter += 1;
-        let config = ServiceStoreClient::new_test_config().await?;
+        let config = StorageServiceDatabase::new_test_config().await?;
         if self.namespace.is_empty() {
             self.namespace = generate_test_namespace();
         }
         let namespace = format!("{}_{}", self.namespace, self.instance_counter);
-        let root_key = &[];
-        Ok(DbStorage::new_for_testing(
-            config,
-            &namespace,
-            root_key,
-            self.wasm_runtime,
-            self.clock.clone(),
+        Ok(
+            DbStorage::new_for_testing(config, &namespace, self.wasm_runtime, self.clock.clone())
+                .await?,
         )
-        .await?)
     }
 
     fn clock(&self) -> &TestClock {
@@ -1180,24 +1338,19 @@ impl DynamoDbStorageBuilder {
 #[cfg(feature = "dynamodb")]
 #[async_trait]
 impl StorageBuilder for DynamoDbStorageBuilder {
-    type Storage = DbStorage<DynamoDbStore, TestClock>;
+    type Storage = DbStorage<DynamoDbDatabase, TestClock>;
 
     async fn build(&mut self) -> Result<Self::Storage, anyhow::Error> {
         self.instance_counter += 1;
-        let config = DynamoDbStore::new_test_config().await?;
+        let config = DynamoDbDatabase::new_test_config().await?;
         if self.namespace.is_empty() {
             self.namespace = generate_test_namespace();
         }
         let namespace = format!("{}_{}", self.namespace, self.instance_counter);
-        let root_key = &[];
-        Ok(DbStorage::new_for_testing(
-            config,
-            &namespace,
-            root_key,
-            self.wasm_runtime,
-            self.clock.clone(),
+        Ok(
+            DbStorage::new_for_testing(config, &namespace, self.wasm_runtime, self.clock.clone())
+                .await?,
         )
-        .await?)
     }
 
     fn clock(&self) -> &TestClock {
@@ -1230,27 +1383,32 @@ impl ScyllaDbStorageBuilder {
 #[cfg(feature = "scylladb")]
 #[async_trait]
 impl StorageBuilder for ScyllaDbStorageBuilder {
-    type Storage = DbStorage<ScyllaDbStore, TestClock>;
+    type Storage = DbStorage<ScyllaDbDatabase, TestClock>;
 
     async fn build(&mut self) -> Result<Self::Storage, anyhow::Error> {
         self.instance_counter += 1;
-        let config = ScyllaDbStore::new_test_config().await?;
+        let config = ScyllaDbDatabase::new_test_config().await?;
         if self.namespace.is_empty() {
             self.namespace = generate_test_namespace();
         }
         let namespace = format!("{}_{}", self.namespace, self.instance_counter);
-        let root_key = &[];
-        Ok(DbStorage::new_for_testing(
-            config,
-            &namespace,
-            root_key,
-            self.wasm_runtime,
-            self.clock.clone(),
+        Ok(
+            DbStorage::new_for_testing(config, &namespace, self.wasm_runtime, self.clock.clone())
+                .await?,
         )
-        .await?)
     }
 
     fn clock(&self) -> &TestClock {
         &self.clock
+    }
+}
+
+pub trait ClientOutcomeResultExt<T, E> {
+    fn unwrap_ok_committed(self) -> T;
+}
+
+impl<T, E: std::fmt::Debug> ClientOutcomeResultExt<T, E> for Result<ClientOutcome<T>, E> {
+    fn unwrap_ok_committed(self) -> T {
+        self.unwrap().unwrap()
     }
 }

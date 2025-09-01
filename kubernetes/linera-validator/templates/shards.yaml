@@ -21,6 +21,7 @@ metadata:
 spec:
   serviceName: "shards"
   replicas: {{ .Values.numShards }}
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       app: shards
@@ -29,12 +30,20 @@ spec:
       labels:
         app: shards
     spec:
+      {{- if eq .Values.environment "GCP" }}
+      nodeSelector:
+        workload: shards
+      tolerations:
+      - key: shards
+        value: "true"
+        effect: NoSchedule
+      {{- end }}
       terminationGracePeriodSeconds: 10
       initContainers:
         - name: linera-server-initializer
           image: {{ .Values.lineraImage }}
           imagePullPolicy: {{ .Values.lineraImagePullPolicy }}
-          command: ["./server-init.sh"]
+          command: ["./server-init.sh", {{ .Values.storage | quote }}, {{ .Values.storageReplicationFactor | quote }}]
           env:
             - name: RUST_LOG
               value: {{ .Values.logLevel }}
@@ -44,18 +53,30 @@ spec:
             - name: config
               mountPath: "/config"
               readOnly: true
+            {{- if .Values.dualStore }}
+            - name: linera-db
+              mountPath: "/linera.db"
+            {{- end }}
       containers:
         - name: linera-server
           image: {{ .Values.lineraImage }}
           imagePullPolicy: {{ .Values.lineraImagePullPolicy }}
-          command: ["./server-entrypoint.sh"]
+          command: ["./server-entrypoint.sh", {{ .Values.storage | quote }}, {{ .Values.storageReplicationFactor | quote }}]
           env:
             - name: RUST_LOG
               value: {{ .Values.logLevel }}
+            {{- if .Values.serverTokioThreads }}
+            - name: LINERA_SERVER_TOKIO_THREADS
+              value: "{{ .Values.serverTokioThreads }}"
+            {{- end }}
           volumeMounts:
             - name: config
               mountPath: "/config"
               readOnly: true
+            {{- if .Values.dualStore }}
+            - name: linera-db
+              mountPath: "/linera.db"
+            {{- end }}
       volumes:
         - name: config
           configMap:
@@ -65,3 +86,16 @@ spec:
                 path: server.json
               - key: genesisConfig
                 path: genesis.json
+  {{- if .Values.dualStore }}
+  volumeClaimTemplates:
+    - metadata:
+        name: linera-db
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.usingLocalSsd }}
+        storageClassName: nvme-ssd-block
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.rocksdbStorageSize }}
+  {{- end }}

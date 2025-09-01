@@ -6,13 +6,12 @@ use std::{env, sync::Arc};
 use anyhow::Result;
 use async_trait::async_trait;
 use linera_base::data_types::Amount;
-use linera_client::persistent::{self, Persist};
-use linera_execution::ResourceControlPolicy;
+use linera_persistent::{self as persistent, Persist};
 use tempfile::{tempdir, TempDir};
 
 use super::{
-    local_net::PathProvider, ClientWrapper, Faucet, FaucetOption, LineraNet, LineraNetConfig,
-    Network, OnClientDrop,
+    local_net::PathProvider, ClientWrapper, Faucet, LineraNet, LineraNetConfig, Network,
+    OnClientDrop,
 };
 
 pub struct RemoteNetTestingConfig {
@@ -43,18 +42,15 @@ impl LineraNetConfig for RemoteNetTestingConfig {
     type Net = RemoteNet;
 
     async fn instantiate(self) -> Result<(Self::Net, ClientWrapper)> {
-        let seed = 37;
-        let mut net = RemoteNet::new(Some(seed), &self.faucet)
+        let mut net = RemoteNet::new(None, &self.faucet)
             .await
             .expect("Creating RemoteNet should not fail");
 
         let client = net.make_client().await;
         // The tests assume we've created a genesis config with 2
         // chains with 10 tokens each. We create the first chain here
-        client
-            .wallet_init(&[], FaucetOption::NewChain(&self.faucet))
-            .await
-            .unwrap();
+        client.wallet_init(Some(&self.faucet)).await?;
+        client.request_chain(&self.faucet, true).await?;
 
         // And the remaining 2 here
         for _ in 0..2 {
@@ -65,14 +61,6 @@ impl LineraNetConfig for RemoteNetTestingConfig {
         }
 
         Ok((net, client))
-    }
-
-    async fn policy(&self) -> ResourceControlPolicy {
-        self.faucet
-            .genesis_config()
-            .await
-            .expect("should get genesis config from faucet")
-            .policy
     }
 }
 

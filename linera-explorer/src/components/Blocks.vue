@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { HashedConfirmedBlock } from '../../gql/service'
+import { ConfirmedBlock } from '../../gql/service'
+import { getOperations, getIncomingBundles } from './utils'
 
-defineProps<{blocks: HashedConfirmedBlock[]}>()
+defineProps<{blocks: ConfirmedBlock[]}>()
 </script>
 
 <template>
@@ -23,16 +24,16 @@ defineProps<{blocks: HashedConfirmedBlock[]}>()
       </thead>
       <tbody>
         <tr v-for="b in blocks" :key="'blocks-block-'+b.hash">
-          <td>{{ b.value.block.header.height }}</td>
+          <td>{{ b.block.header.height }}</td>
           <td :title="b.hash">
             <a @click="$root.route('block', [['block', b.hash]])" class="btn btn-link">{{ short_hash(b.hash) }}</a>
           </td>
-          <td>{{ (new Date(b.value.block.header.timestamp/1000)).toLocaleString() }}</td>
-          <td :title="b.value.block.header.authenticatedSigner">{{ short_hash(b.value.block.header.authenticatedSigner) }}</td>
-          <td>{{ b.value.status }}</td>
-          <td>{{ b.value.block.body.incomingBundles.length }}</td>
-          <td>{{ b.value.block.body.messages.length }}</td>
-          <td>{{ b.value.block.body.operations.length }}</td>
+          <td>{{ (new Date(b.block.header.timestamp/1000)).toLocaleString() }}</td>
+          <td :title="b.block.header.authenticatedSigner">{{ b.block.header.authenticatedSigner }}</td>
+          <td>{{ b.status }}</td>
+          <td>{{ getIncomingBundles(b.block.body.transactionMetadata).length }}</td>
+          <td>{{ b.block.body.messages.length }}</td>
+          <td>{{ getOperations(b.block.body.transactionMetadata).length }}</td>
           <td>
             <button class="btn btn-link btn-sm" data-bs-toggle="modal" :data-bs-target="'#'+b.hash+'-modal'" @click="json_load(b.hash+'-json', b)">
               <i class="bi bi-braces"></i>

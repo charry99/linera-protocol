@@ -7,17 +7,17 @@ use std::{
     sync::Mutex,
 };
 
-use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     batch::Batch,
     common::from_bytes_option,
     context::Context,
-    views::{ClonableView, HashableView, Hasher, View, ViewError, MIN_VIEW_TAG},
+    store::ReadableKeyValueStore as _,
+    views::{ClonableView, HashableView, Hasher, ReplaceContext, View, ViewError, MIN_VIEW_TAG},
 };
 
-/// A hash for ContainerView and storing of the hash for memoization purposes
+/// A hash for `ContainerView` and storing of the hash for memoization purposes
 #[derive(Debug)]
 pub struct WrappedHashableContainerView<C, W, O> {
     _phantom: PhantomData<C>,
@@ -26,7 +26,7 @@ pub struct WrappedHashableContainerView<C, W, O> {
     inner: W,
 }
 
-/// Key tags to create the sub-keys of a MapView on top of the base key.
+/// Key tags to create the sub-keys of a `MapView` on top of the base key.
 #[repr(u8)]
 enum KeyTag {
     /// Prefix for the indices of the view.
@@ -35,32 +35,54 @@ enum KeyTag {
     Hash,
 }
 
-#[async_trait]
-impl<C, W, O> View<C> for WrappedHashableContainerView<C, W, O>
+impl<C, W, O, C2> ReplaceContext<C2> for WrappedHashableContainerView<C, W, O>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    W: HashableView<C> + Send + Sync,
+    W: HashableView<Hasher: Hasher<Output = O>, Context = C> + ReplaceContext<C2>,
+    <W as ReplaceContext<C2>>::Target: HashableView<Hasher: Hasher<Output = O>>,
     O: Serialize + DeserializeOwned + Send + Sync + Copy + PartialEq,
-    W::Hasher: Hasher<Output = O>,
+    C: Context,
+    C2: Context,
+{
+    type Target = WrappedHashableContainerView<C2, <W as ReplaceContext<C2>>::Target, O>;
+
+    async fn with_context(
+        &mut self,
+        ctx: impl FnOnce(&Self::Context) -> C2 + Clone,
+    ) -> Self::Target {
+        let hash = *self.hash.lock().unwrap();
+        WrappedHashableContainerView {
+            _phantom: PhantomData,
+            stored_hash: self.stored_hash,
+            hash: Mutex::new(hash),
+            inner: self.inner.with_context(ctx).await,
+        }
+    }
+}
+
+impl<W: HashableView, O> View for WrappedHashableContainerView<W::Context, W, O>
+where
+    W: HashableView<Hasher: Hasher<Output = O>>,
+    O: Serialize + DeserializeOwned + Send + Sync + Copy + PartialEq,
 {
     const NUM_INIT_KEYS: usize = 1 + W::NUM_INIT_KEYS;
 
-    fn context(&self) -> &C {
+    type Context = W::Context;
+
+    fn context(&self) -> &Self::Context {
         self.inner.context()
     }
 
-    fn pre_load(context: &C) -> Result<Vec<Vec<u8>>, ViewError> {
-        let mut v = vec![context.base_tag(KeyTag::Hash as u8)];
-        let base_key = context.base_tag(KeyTag::Inner as u8);
+    fn pre_load(context: &Self::Context) -> Result<Vec<Vec<u8>>, ViewError> {
+        let mut v = vec![context.base_key().base_tag(KeyTag::Hash as u8)];
+        let base_key = context.base_key().base_tag(KeyTag::Inner as u8);
         let context = context.clone_with_base_key(base_key);
         v.extend(W::pre_load(&context)?);
         Ok(v)
     }
 
-    fn post_load(context: C, values: &[Option<Vec<u8>>]) -> Result<Self, ViewError> {
+    fn post_load(context: Self::Context, values: &[Option<Vec<u8>>]) -> Result<Self, ViewError> {
         let hash = from_bytes_option(values.first().ok_or(ViewError::PostLoadValuesError)?)?;
-        let base_key = context.base_tag(KeyTag::Inner as u8);
+        let base_key = context.base_key().base_tag(KeyTag::Inner as u8);
         let context = context.clone_with_base_key(base_key);
         let inner = W::post_load(
             context,
@@ -74,9 +96,9 @@ where
         })
     }
 
-    async fn load(context: C) -> Result<Self, ViewError> {
+    async fn load(context: Self::Context) -> Result<Self, ViewError> {
         let keys = Self::pre_load(&context)?;
-        let values = context.read_multi_values_bytes(keys).await?;
+        let values = context.store().read_multi_values_bytes(keys).await?;
         Self::post_load(context, &values)
     }
 
@@ -97,13 +119,13 @@ where
         let delete_view = self.inner.flush(batch)?;
         let hash = self.hash.get_mut().unwrap();
         if delete_view {
-            let mut key_prefix = self.inner.context().base_key();
+            let mut key_prefix = self.inner.context().base_key().bytes.clone();
             key_prefix.pop();
             batch.delete_key_prefix(key_prefix);
             self.stored_hash = None;
             *hash = None;
         } else if self.stored_hash != *hash {
-            let mut key = self.inner.context().base_key();
+            let mut key = self.inner.context().base_key().bytes.clone();
             let tag = key.last_mut().unwrap();
             *tag = KeyTag::Hash as u8;
             match hash {
@@ -121,30 +143,25 @@ where
     }
 }
 
-impl<C, W, O> ClonableView<C> for WrappedHashableContainerView<C, W, O>
+impl<W, O> ClonableView for WrappedHashableContainerView<W::Context, W, O>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    W: HashableView<C> + ClonableView<C> + Send + Sync,
+    W: HashableView + ClonableView,
     O: Serialize + DeserializeOwned + Send + Sync + Copy + PartialEq,
     W::Hasher: Hasher<Output = O>,
 {
-    fn clone_unchecked(&mut self) -> Result<Self, ViewError> {
-        Ok(WrappedHashableContainerView {
+    fn clone_unchecked(&mut self) -> Self {
+        WrappedHashableContainerView {
             _phantom: PhantomData,
             stored_hash: self.stored_hash,
             hash: Mutex::new(*self.hash.get_mut().unwrap()),
-            inner: self.inner.clone_unchecked()?,
-        })
+            inner: self.inner.clone_unchecked(),
+        }
     }
 }
 
-#[async_trait]
-impl<C, W, O> HashableView<C> for WrappedHashableContainerView<C, W, O>
+impl<W, O> HashableView for WrappedHashableContainerView<W::Context, W, O>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    W: HashableView<C> + Send + Sync,
+    W: HashableView,
     O: Serialize + DeserializeOwned + Send + Sync + Copy + PartialEq,
     W::Hasher: Hasher<Output = O>,
 {
@@ -192,6 +209,7 @@ impl<C, W, O> DerefMut for WrappedHashableContainerView<C, W, O> {
     }
 }
 
+#[cfg(with_graphql)]
 mod graphql {
     use std::borrow::Cow;
 
@@ -200,7 +218,7 @@ mod graphql {
 
     impl<C, W, O> async_graphql::OutputType for WrappedHashableContainerView<C, W, O>
     where
-        C: Context + Send + Sync,
+        C: Context,
         W: async_graphql::OutputType + Send + Sync,
         O: Send + Sync,
     {

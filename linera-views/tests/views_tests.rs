@@ -4,38 +4,36 @@
 use std::collections::BTreeSet;
 
 use anyhow::Result;
-use async_trait::async_trait;
 #[cfg(with_dynamodb)]
-use linera_views::dynamo_db::DynamoDbStore;
+use linera_views::dynamo_db::DynamoDbDatabase;
 #[cfg(with_rocksdb)]
-use linera_views::rocks_db::RocksDbStore;
+use linera_views::rocks_db::RocksDbDatabase;
 #[cfg(with_scylladb)]
-use linera_views::scylla_db::ScyllaDbStore;
-#[cfg(any(with_scylladb, with_rocksdb, with_dynamodb))]
-use linera_views::store::AdminKeyValueStore as _;
+use linera_views::scylla_db::ScyllaDbDatabase;
 use linera_views::{
     batch::{
         Batch, WriteOperation,
         WriteOperation::{Delete, DeletePrefix, Put},
     },
     collection_view::HashedCollectionView,
-    context::{create_test_memory_context, Context, MemoryContext, ViewContext},
+    context::{Context, MemoryContext, ViewContext},
     key_value_store_view::{KeyValueStoreView, ViewContainer},
     log_view::HashedLogView,
-    lru_caching::{LruCachingMemoryStore, LruCachingStore},
+    lru_caching::LruCachingMemoryDatabase,
     map_view::{ByteMapView, HashedMapView},
-    memory::MemoryStore,
+    memory::MemoryDatabase,
     queue_view::HashedQueueView,
     random::make_deterministic_rng,
     reentrant_collection_view::HashedReentrantCollectionView,
     register_view::HashedRegisterView,
     set_view::HashedSetView,
-    store::TestKeyValueStore as _,
+    store::{KeyValueDatabase, TestKeyValueDatabase as _, WritableKeyValueStore as _},
     test_utils::{
         get_random_byte_vector, get_random_key_value_operations, get_random_key_values,
         span_random_reordering_put_delete,
     },
-    views::{CryptoHashRootView, HashableView, Hasher, RootView, View, ViewError},
+    views::{CryptoHashRootView, HashableView, Hasher, RootView, View},
+    ViewError,
 };
 use rand::{Rng, RngCore};
 
@@ -58,9 +56,9 @@ pub struct StateView<C> {
     pub key_value_store: KeyValueStoreView<C>,
 }
 
-#[async_trait]
+#[allow(async_fn_in_trait)]
 pub trait StateStorage {
-    type Context: Context<Extra = usize> + Clone + Send + Sync + 'static;
+    type Context: Context<Extra = usize> + 'static;
 
     async fn new() -> Self;
 
@@ -68,27 +66,26 @@ pub trait StateStorage {
 }
 
 pub struct MemoryTestStorage {
+    database: MemoryDatabase,
     accessed_chains: BTreeSet<usize>,
-    store: MemoryStore,
 }
 
-#[async_trait]
 impl StateStorage for MemoryTestStorage {
     type Context = MemoryContext<usize>;
 
     async fn new() -> Self {
-        let store = MemoryStore::new_test_store().await.unwrap();
+        let database = MemoryDatabase::connect_test_namespace().await.unwrap();
         MemoryTestStorage {
+            database,
             accessed_chains: BTreeSet::new(),
-            store,
         }
     }
 
     async fn load(&mut self, id: usize) -> Result<StateView<Self::Context>, ViewError> {
         self.accessed_chains.insert(id);
-        let base_key = bcs::to_bytes(&id)?;
-        let store = self.store.clone();
-        let context = Self::Context::new_unsafe(store, base_key, id);
+        let root_key = bcs::to_bytes(&id)?;
+        let store = self.database.open_exclusive(&root_key)?;
+        let context = ViewContext::create_root_context(store, id).await?;
         StateView::load(context).await
     }
 }
@@ -98,12 +95,11 @@ pub struct KeyValueStoreTestStorage {
     store: ViewContainer<MemoryContext<()>>,
 }
 
-#[async_trait]
 impl StateStorage for KeyValueStoreTestStorage {
     type Context = ViewContext<usize, ViewContainer<MemoryContext<()>>>;
 
     async fn new() -> Self {
-        let context = create_test_memory_context();
+        let context = MemoryContext::new_for_testing(());
         let store = ViewContainer::new(context).await.unwrap();
         KeyValueStoreTestStorage {
             accessed_chains: BTreeSet::new(),
@@ -121,49 +117,47 @@ impl StateStorage for KeyValueStoreTestStorage {
 }
 
 pub struct LruMemoryStorage {
+    database: LruCachingMemoryDatabase,
     accessed_chains: BTreeSet<usize>,
-    store: LruCachingStore<MemoryStore>,
 }
 
-#[async_trait]
 impl StateStorage for LruMemoryStorage {
-    type Context = ViewContext<usize, LruCachingMemoryStore>;
+    type Context = ViewContext<usize, <LruCachingMemoryDatabase as KeyValueDatabase>::Store>;
 
     async fn new() -> Self {
-        let store = MemoryStore::new_test_store().await.unwrap();
-        let cache_size = 1000;
-        let store = LruCachingStore::new(store, cache_size);
+        let database = LruCachingMemoryDatabase::connect_test_namespace()
+            .await
+            .unwrap();
         LruMemoryStorage {
             accessed_chains: BTreeSet::new(),
-            store,
+            database,
         }
     }
 
     async fn load(&mut self, id: usize) -> Result<StateView<Self::Context>, ViewError> {
         self.accessed_chains.insert(id);
-        let base_key = bcs::to_bytes(&id)?;
-        let store = self.store.clone();
-        let context = Self::Context::new_unsafe(store, base_key, id);
+        let root_key = bcs::to_bytes(&id)?;
+        let store = self.database.open_exclusive(&root_key)?;
+        let context = ViewContext::create_root_context(store, id).await?;
         StateView::load(context).await
     }
 }
 
 #[cfg(with_rocksdb)]
 pub struct RocksDbTestStorage {
-    store: RocksDbStore,
+    database: RocksDbDatabase,
     accessed_chains: BTreeSet<usize>,
 }
 
 #[cfg(with_rocksdb)]
-#[async_trait]
 impl StateStorage for RocksDbTestStorage {
-    type Context = ViewContext<usize, RocksDbStore>;
+    type Context = ViewContext<usize, <RocksDbDatabase as KeyValueDatabase>::Store>;
 
     async fn new() -> Self {
-        let store = RocksDbStore::new_test_store().await.unwrap();
+        let database = RocksDbDatabase::connect_test_namespace().await.unwrap();
         let accessed_chains = BTreeSet::new();
         RocksDbTestStorage {
-            store,
+            database,
             accessed_chains,
         }
     }
@@ -171,7 +165,7 @@ impl StateStorage for RocksDbTestStorage {
     async fn load(&mut self, id: usize) -> Result<StateView<Self::Context>, ViewError> {
         self.accessed_chains.insert(id);
         let root_key = bcs::to_bytes(&id)?;
-        let store = self.store.clone_with_root_key(&root_key)?;
+        let store = self.database.open_exclusive(&root_key)?;
         let context = ViewContext::create_root_context(store, id).await?;
         StateView::load(context).await
     }
@@ -179,20 +173,19 @@ impl StateStorage for RocksDbTestStorage {
 
 #[cfg(with_scylladb)]
 pub struct ScyllaDbTestStorage {
-    store: ScyllaDbStore,
+    database: ScyllaDbDatabase,
     accessed_chains: BTreeSet<usize>,
 }
 
 #[cfg(with_scylladb)]
-#[async_trait]
 impl StateStorage for ScyllaDbTestStorage {
-    type Context = ViewContext<usize, ScyllaDbStore>;
+    type Context = ViewContext<usize, <ScyllaDbDatabase as KeyValueDatabase>::Store>;
 
     async fn new() -> Self {
-        let store = ScyllaDbStore::new_test_store().await.unwrap();
+        let database = ScyllaDbDatabase::connect_test_namespace().await.unwrap();
         let accessed_chains = BTreeSet::new();
         ScyllaDbTestStorage {
-            store,
+            database,
             accessed_chains,
         }
     }
@@ -200,7 +193,7 @@ impl StateStorage for ScyllaDbTestStorage {
     async fn load(&mut self, id: usize) -> Result<StateView<Self::Context>, ViewError> {
         self.accessed_chains.insert(id);
         let root_key = bcs::to_bytes(&id)?;
-        let store = self.store.clone_with_root_key(&root_key)?;
+        let store = self.database.open_exclusive(&root_key)?;
         let context = ViewContext::create_root_context(store, id).await?;
         StateView::load(context).await
     }
@@ -208,20 +201,19 @@ impl StateStorage for ScyllaDbTestStorage {
 
 #[cfg(with_dynamodb)]
 pub struct DynamoDbTestStorage {
-    store: DynamoDbStore,
+    database: DynamoDbDatabase,
     accessed_chains: BTreeSet<usize>,
 }
 
 #[cfg(with_dynamodb)]
-#[async_trait]
 impl StateStorage for DynamoDbTestStorage {
-    type Context = ViewContext<usize, DynamoDbStore>;
+    type Context = ViewContext<usize, <DynamoDbDatabase as KeyValueDatabase>::Store>;
 
     async fn new() -> Self {
-        let store = DynamoDbStore::new_test_store().await.unwrap();
+        let database = DynamoDbDatabase::connect_test_namespace().await.unwrap();
         let accessed_chains = BTreeSet::new();
         DynamoDbTestStorage {
-            store,
+            database,
             accessed_chains,
         }
     }
@@ -229,7 +221,7 @@ impl StateStorage for DynamoDbTestStorage {
     async fn load(&mut self, id: usize) -> Result<StateView<Self::Context>, ViewError> {
         self.accessed_chains.insert(id);
         let root_key = bcs::to_bytes(&id)?;
-        let store = self.store.clone_with_root_key(&root_key)?;
+        let store = self.database.open_exclusive(&root_key)?;
         let context = ViewContext::create_root_context(store, id).await?;
         StateView::load(context).await
     }
@@ -317,7 +309,6 @@ async fn test_store<S>(
 ) -> Result<<sha3::Sha3_256 as Hasher>::Output>
 where
     S: StateStorage,
-    ViewError: From<<<S as StateStorage>::Context as Context>::Error>,
 {
     let default_hash = {
         let view = store.load(1).await?;
@@ -627,7 +618,7 @@ pub struct ByteMapStateView<C> {
 
 #[tokio::test]
 async fn test_byte_map_view() -> Result<()> {
-    let context = create_test_memory_context();
+    let context = MemoryContext::new_for_testing(());
     {
         let mut view = ByteMapStateView::load(context.clone()).await?;
         view.map.insert(vec![0, 1], 5);
@@ -772,7 +763,6 @@ async fn test_views_in_dynamo_db() -> Result<()> {
 async fn test_store_rollback_kernel<S>(store: &mut S) -> Result<()>
 where
     S: StateStorage,
-    ViewError: From<<<S as StateStorage>::Context as Context>::Error>,
 {
     {
         let mut view = store.load(1).await?;
@@ -824,7 +814,7 @@ async fn test_collection_removal() -> Result<()> {
     type EntryType = HashedRegisterView<MemoryContext<()>, u8>;
     type CollectionViewType = HashedCollectionView<MemoryContext<()>, u8, EntryType>;
 
-    let context = create_test_memory_context();
+    let context = MemoryContext::new_for_testing(());
 
     // Write a dummy entry into the collection.
     let mut collection = CollectionViewType::load(context.clone()).await?;
@@ -832,14 +822,14 @@ async fn test_collection_removal() -> Result<()> {
     entry.set(1);
     let mut batch = Batch::new();
     collection.flush(&mut batch)?;
-    collection.context().write_batch(batch).await?;
+    collection.context().store().write_batch(batch).await?;
 
     // Remove the entry from the collection.
     let mut collection = CollectionViewType::load(context.clone()).await?;
     collection.remove_entry(&1)?;
     let mut batch = Batch::new();
     collection.flush(&mut batch)?;
-    collection.context().write_batch(batch).await?;
+    collection.context().store().write_batch(batch).await?;
 
     // Check that the entry was removed.
     let collection = CollectionViewType::load(context.clone()).await?;
@@ -855,7 +845,7 @@ async fn test_removal_api_first_second_condition(
     type EntryType = HashedRegisterView<MemoryContext<()>, u8>;
     type CollectionViewType = HashedCollectionView<MemoryContext<()>, u8, EntryType>;
 
-    let context = create_test_memory_context();
+    let context = MemoryContext::new_for_testing(());
 
     // First add an entry `1` with value `100` and commit
     let mut collection: CollectionViewType = HashedCollectionView::load(context.clone()).await?;
@@ -863,7 +853,7 @@ async fn test_removal_api_first_second_condition(
     entry.set(100);
     let mut batch = Batch::new();
     collection.flush(&mut batch)?;
-    collection.context().write_batch(batch).await?;
+    collection.context().store().write_batch(batch).await?;
 
     // Reload the collection view and remove the entry, but don't commit yet
     let mut collection: CollectionViewType = HashedCollectionView::load(context.clone()).await?;
@@ -884,7 +874,7 @@ async fn test_removal_api_first_second_condition(
     // We commit
     let mut batch = Batch::new();
     collection.flush(&mut batch)?;
-    collection.context().write_batch(batch).await?;
+    collection.context().store().write_batch(batch).await?;
 
     let mut collection: CollectionViewType = HashedCollectionView::load(context.clone()).await?;
     let expected_val = if second_condition {
@@ -924,7 +914,6 @@ async fn compute_hash_unordered_put_view<S>(
 ) -> Result<<sha3::Sha3_256 as Hasher>::Output>
 where
     S: StateStorage,
-    ViewError: From<<<S as StateStorage>::Context as Context>::Error>,
 {
     let mut view = store.load(1).await?;
     for key_value in key_value_vector {
@@ -955,7 +944,6 @@ async fn compute_hash_unordered_putdelete_view<S>(
 ) -> Result<<sha3::Sha3_256 as Hasher>::Output>
 where
     S: StateStorage,
-    ViewError: From<<<S as StateStorage>::Context as Context>::Error>,
 {
     let mut view = store.load(1).await?;
     for operation in operations {
@@ -999,7 +987,6 @@ async fn compute_hash_ordered_view<S>(
 ) -> Result<<sha3::Sha3_256 as Hasher>::Output>
 where
     S: StateStorage,
-    ViewError: From<<<S as StateStorage>::Context as Context>::Error>,
 {
     let mut view = store.load(1).await?;
     for key_value in key_value_vector {
@@ -1075,7 +1062,6 @@ async fn check_hash_memoization_persistence<S>(
 ) -> Result<()>
 where
     S: StateStorage,
-    ViewError: From<<<S as StateStorage>::Context as Context>::Error>,
 {
     let mut hash = {
         let view = store.load(1).await?;
@@ -1168,7 +1154,6 @@ async fn check_hash_memoization_persistence_large() -> Result<()> {
 async fn check_large_write<S>(store: &mut S, vector: Vec<u8>) -> Result<()>
 where
     S: StateStorage,
-    ViewError: From<<<S as StateStorage>::Context as Context>::Error>,
 {
     let hash1 = {
         let mut view = store.load(1).await?;

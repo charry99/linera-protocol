@@ -1,44 +1,46 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(with_metrics)]
-use std::sync::LazyLock;
 use std::{
     collections::{vec_deque::IterMut, VecDeque},
     ops::Range,
 };
 
-use async_trait::async_trait;
-use serde::{de::DeserializeOwned, Serialize};
 #[cfg(with_metrics)]
-use {
-    linera_base::prometheus_util::{bucket_latencies, register_histogram_vec, MeasureLatency},
-    prometheus::HistogramVec,
-};
+use linera_base::prometheus_util::MeasureLatency as _;
+use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     batch::Batch,
     common::{from_bytes_option_or_default, HasherOutput},
     context::Context,
     hashable_wrapper::WrappedHashableContainerView,
+    store::ReadableKeyValueStore as _,
     views::{ClonableView, HashableView, Hasher, View, ViewError, MIN_VIEW_TAG},
 };
 
 #[cfg(with_metrics)]
-/// The runtime of hash computation
-static QUEUE_VIEW_HASH_RUNTIME: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "queue_view_hash_runtime",
-        "QueueView hash runtime",
-        &[],
-        bucket_latencies(5.0),
-    )
-});
+mod metrics {
+    use std::sync::LazyLock;
 
-/// Key tags to create the sub-keys of a QueueView on top of the base key.
+    use linera_base::prometheus_util::{exponential_bucket_latencies, register_histogram_vec};
+    use prometheus::HistogramVec;
+
+    /// The runtime of hash computation
+    pub static QUEUE_VIEW_HASH_RUNTIME: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "queue_view_hash_runtime",
+            "QueueView hash runtime",
+            &[],
+            exponential_bucket_latencies(5.0),
+        )
+    });
+}
+
+/// Key tags to create the sub-keys of a `QueueView` on top of the base key.
 #[repr(u8)]
 enum KeyTag {
-    /// Prefix for the storing of the variable stored_indices.
+    /// Prefix for the storing of the variable `stored_indices`.
     Store = MIN_VIEW_TAG,
     /// Prefix for the indices of the log.
     Index,
@@ -54,21 +56,21 @@ pub struct QueueView<C, T> {
     new_back_values: VecDeque<T>,
 }
 
-#[async_trait]
-impl<C, T> View<C> for QueueView<C, T>
+impl<C, T> View for QueueView<C, T>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    T: Send + Sync + Serialize,
+    C: Context,
+    T: Serialize + Send + Sync,
 {
     const NUM_INIT_KEYS: usize = 1;
+
+    type Context = C;
 
     fn context(&self) -> &C {
         &self.context
     }
 
     fn pre_load(context: &C) -> Result<Vec<Vec<u8>>, ViewError> {
-        Ok(vec![context.base_tag(KeyTag::Store as u8)])
+        Ok(vec![context.base_key().base_tag(KeyTag::Store as u8)])
     }
 
     fn post_load(context: C, values: &[Option<Vec<u8>>]) -> Result<Self, ViewError> {
@@ -85,7 +87,7 @@ where
 
     async fn load(context: C) -> Result<Self, ViewError> {
         let keys = Self::pre_load(&context)?;
-        let values = context.read_multi_values_bytes(keys).await?;
+        let values = context.store().read_multi_values_bytes(keys).await?;
         Self::post_load(context, &values)
     }
 
@@ -108,18 +110,21 @@ where
     fn flush(&mut self, batch: &mut Batch) -> Result<bool, ViewError> {
         let mut delete_view = false;
         if self.delete_storage_first {
-            batch.delete_key_prefix(self.context.base_key());
+            batch.delete_key_prefix(self.context.base_key().bytes.clone());
             delete_view = true;
         }
         if self.stored_count() == 0 {
-            let key_prefix = self.context.base_tag(KeyTag::Index as u8);
+            let key_prefix = self.context.base_key().base_tag(KeyTag::Index as u8);
             batch.delete_key_prefix(key_prefix);
             self.stored_indices = Range::default();
         } else if self.front_delete_count > 0 {
             let deletion_range = self.stored_indices.clone().take(self.front_delete_count);
             self.stored_indices.start += self.front_delete_count;
             for index in deletion_range {
-                let key = self.context.derive_tag_key(KeyTag::Index as u8, &index)?;
+                let key = self
+                    .context
+                    .base_key()
+                    .derive_tag_key(KeyTag::Index as u8, &index)?;
                 batch.delete_key(key);
             }
         }
@@ -128,6 +133,7 @@ where
             for value in &self.new_back_values {
                 let key = self
                     .context
+                    .base_key()
                     .derive_tag_key(KeyTag::Index as u8, &self.stored_indices.end)?;
                 batch.put_key_value(key, value)?;
                 self.stored_indices.end += 1;
@@ -135,7 +141,7 @@ where
             self.new_back_values.clear();
         }
         if !self.delete_storage_first || !self.stored_indices.is_empty() {
-            let key = self.context.base_tag(KeyTag::Store as u8);
+            let key = self.context.base_key().base_tag(KeyTag::Store as u8);
             batch.put_key_value(key, &self.stored_indices)?;
         }
         self.front_delete_count = 0;
@@ -149,20 +155,19 @@ where
     }
 }
 
-impl<C, T> ClonableView<C> for QueueView<C, T>
+impl<C, T> ClonableView for QueueView<C, T>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     T: Clone + Send + Sync + Serialize,
 {
-    fn clone_unchecked(&mut self) -> Result<Self, ViewError> {
-        Ok(QueueView {
+    fn clone_unchecked(&mut self) -> Self {
+        QueueView {
             context: self.context.clone(),
             stored_indices: self.stored_indices.clone(),
             front_delete_count: self.front_delete_count,
             delete_storage_first: self.delete_storage_first,
             new_back_values: self.new_back_values.clone(),
-        })
+        }
     }
 }
 
@@ -178,22 +183,24 @@ impl<C, T> QueueView<C, T> {
 
 impl<'a, C, T> QueueView<C, T>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     T: Send + Sync + Clone + Serialize + DeserializeOwned,
 {
     async fn get(&self, index: usize) -> Result<Option<T>, ViewError> {
-        let key = self.context.derive_tag_key(KeyTag::Index as u8, &index)?;
-        Ok(self.context.read_value(&key).await?)
+        let key = self
+            .context
+            .base_key()
+            .derive_tag_key(KeyTag::Index as u8, &index)?;
+        Ok(self.context.store().read_value(&key).await?)
     }
 
     /// Reads the front value, if any.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::queue_view::QueueView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = QueueView::load(context).await.unwrap();
     /// queue.push_back(34);
     /// queue.push_back(42);
@@ -213,10 +220,10 @@ where
     /// Reads the back value, if any.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::queue_view::QueueView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = QueueView::load(context).await.unwrap();
     /// queue.push_back(34);
     /// queue.push_back(42);
@@ -234,10 +241,10 @@ where
     /// Deletes the front value, if any.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::queue_view::QueueView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = QueueView::load(context).await.unwrap();
     /// queue.push_back(34 as u128);
     /// queue.delete_front();
@@ -255,10 +262,10 @@ where
     /// Pushes a value to the end of the queue.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::queue_view::QueueView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = QueueView::load(context).await.unwrap();
     /// queue.push_back(34);
     /// queue.push_back(37);
@@ -272,10 +279,10 @@ where
     /// Reads the size of the queue.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::queue_view::QueueView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = QueueView::load(context).await.unwrap();
     /// queue.push_back(34);
     /// assert_eq!(queue.count(), 1);
@@ -294,11 +301,14 @@ where
         let count = range.len();
         let mut keys = Vec::with_capacity(count);
         for index in range {
-            let key = self.context.derive_tag_key(KeyTag::Index as u8, &index)?;
+            let key = self
+                .context
+                .base_key()
+                .derive_tag_key(KeyTag::Index as u8, &index)?;
             keys.push(key)
         }
         let mut values = Vec::with_capacity(count);
-        for entry in self.context.read_multi_values(keys).await? {
+        for entry in self.context.store().read_multi_values(keys).await? {
             match entry {
                 None => {
                     return Err(ViewError::MissingEntries);
@@ -312,10 +322,10 @@ where
     /// Reads the `count` next values in the queue (including staged ones).
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::queue_view::QueueView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = QueueView::load(context).await.unwrap();
     /// queue.push_back(34);
     /// queue.push_back(42);
@@ -352,10 +362,10 @@ where
     /// Reads the `count` last values in the queue (including staged ones).
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::queue_view::QueueView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = QueueView::load(context).await.unwrap();
     /// queue.push_back(34);
     /// queue.push_back(42);
@@ -388,10 +398,10 @@ where
     /// Reads all the elements
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::queue_view::QueueView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = QueueView::load(context).await.unwrap();
     /// queue.push_back(34);
     /// queue.push_back(37);
@@ -425,10 +435,10 @@ where
     /// Gets a mutable iterator on the entries of the queue
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::queue_view::QueueView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = QueueView::load(context).await.unwrap();
     /// queue.push_back(34);
     /// let mut iter = queue.iter_mut().await.unwrap();
@@ -443,11 +453,9 @@ where
     }
 }
 
-#[async_trait]
-impl<C, T> HashableView<C> for QueueView<C, T>
+impl<C, T> HashableView for QueueView<C, T>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     T: Send + Sync + Clone + Serialize + DeserializeOwned,
 {
     type Hasher = sha3::Sha3_256;
@@ -458,7 +466,7 @@ where
 
     async fn hash(&self) -> Result<<Self::Hasher as Hasher>::Output, ViewError> {
         #[cfg(with_metrics)]
-        let _hash_latency = QUEUE_VIEW_HASH_RUNTIME.measure_latency();
+        let _hash_latency = metrics::QUEUE_VIEW_HASH_RUNTIME.measure_latency();
         let elements = self.elements().await?;
         let mut hasher = sha3::Sha3_256::default();
         hasher.update_with_bcs_bytes(&elements)?;
@@ -469,6 +477,7 @@ where
 /// Type wrapping `QueueView` while memoizing the hash.
 pub type HashedQueueView<C, T> = WrappedHashableContainerView<C, QueueView<C, T>, HasherOutput>;
 
+#[cfg(with_graphql)]
 mod graphql {
     use std::borrow::Cow;
 
@@ -492,7 +501,6 @@ mod graphql {
     #[async_graphql::Object(cache_control(no_cache), name_type)]
     impl<C: Context, T: async_graphql::OutputType> QueueView<C, T>
     where
-        C: Send + Sync,
         T: serde::ser::Serialize + serde::de::DeserializeOwned + Clone + Send + Sync,
     {
         async fn entries(&self, count: Option<usize>) -> async_graphql::Result<Vec<T>> {

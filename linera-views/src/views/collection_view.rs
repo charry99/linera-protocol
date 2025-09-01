@@ -1,8 +1,6 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(with_metrics)]
-use std::sync::LazyLock;
 use std::{
     borrow::Borrow,
     collections::{btree_map, BTreeMap},
@@ -12,33 +10,36 @@ use std::{
 };
 
 use async_lock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use async_trait::async_trait;
-use serde::{de::DeserializeOwned, Serialize};
 #[cfg(with_metrics)]
-use {
-    linera_base::prometheus_util::{bucket_latencies, register_histogram_vec, MeasureLatency},
-    prometheus::HistogramVec,
-};
+use linera_base::prometheus_util::MeasureLatency as _;
+use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     batch::Batch,
     common::{CustomSerialize, HasherOutput, Update},
-    context::Context,
+    context::{BaseKey, Context},
     hashable_wrapper::WrappedHashableContainerView,
-    store::KeyIterable,
+    store::ReadableKeyValueStore as _,
     views::{ClonableView, HashableView, Hasher, View, ViewError, MIN_VIEW_TAG},
 };
 
 #[cfg(with_metrics)]
-/// The runtime of hash computation
-static COLLECTION_VIEW_HASH_RUNTIME: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "collection_view_hash_runtime",
-        "CollectionView hash runtime",
-        &[],
-        bucket_latencies(5.0),
-    )
-});
+mod metrics {
+    use std::sync::LazyLock;
+
+    use linera_base::prometheus_util::{exponential_bucket_latencies, register_histogram_vec};
+    use prometheus::HistogramVec;
+
+    /// The runtime of hash computation
+    pub static COLLECTION_VIEW_HASH_RUNTIME: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "collection_view_hash_runtime",
+            "CollectionView hash runtime",
+            &[],
+            exponential_bucket_latencies(5.0),
+        )
+    });
+}
 
 /// A view that supports accessing a collection of views of the same kind, indexed by a
 /// `Vec<u8>`, one subview at a time.
@@ -55,7 +56,7 @@ pub struct ReadGuardedView<'a, W> {
     short_key: Vec<u8>,
 }
 
-impl<'a, W> std::ops::Deref for ReadGuardedView<'a, W> {
+impl<W> std::ops::Deref for ReadGuardedView<'_, W> {
     type Target = W;
 
     fn deref(&self) -> &W {
@@ -66,8 +67,8 @@ impl<'a, W> std::ops::Deref for ReadGuardedView<'a, W> {
     }
 }
 
-/// We need to find new base keys in order to implement the collection_view.
-/// We do this by appending a value to the base_key.
+/// We need to find new base keys in order to implement `CollectionView`.
+/// We do this by appending a value to the base key.
 ///
 /// Sub-views in a collection share a common key prefix, like in other view types. However,
 /// just concatenating the shared prefix with sub-view keys makes it impossible to distinguish if a
@@ -81,24 +82,20 @@ enum KeyTag {
     Subview,
 }
 
-#[async_trait]
-impl<C, W> View<C> for ByteCollectionView<C, W>
-where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    W: View<C> + Send + Sync,
-{
+impl<W: View> View for ByteCollectionView<W::Context, W> {
     const NUM_INIT_KEYS: usize = 0;
 
-    fn context(&self) -> &C {
+    type Context = W::Context;
+
+    fn context(&self) -> &Self::Context {
         &self.context
     }
 
-    fn pre_load(_context: &C) -> Result<Vec<Vec<u8>>, ViewError> {
+    fn pre_load(_context: &Self::Context) -> Result<Vec<Vec<u8>>, ViewError> {
         Ok(vec![])
     }
 
-    fn post_load(context: C, _values: &[Option<Vec<u8>>]) -> Result<Self, ViewError> {
+    fn post_load(context: Self::Context, _values: &[Option<Vec<u8>>]) -> Result<Self, ViewError> {
         Ok(Self {
             context,
             delete_storage_first: false,
@@ -106,7 +103,7 @@ where
         })
     }
 
-    async fn load(context: C) -> Result<Self, ViewError> {
+    async fn load(context: Self::Context) -> Result<Self, ViewError> {
         Self::post_load(context, &[])
     }
 
@@ -127,7 +124,7 @@ where
         let mut delete_view = false;
         if self.delete_storage_first {
             delete_view = true;
-            batch.delete_key_prefix(self.context.base_key());
+            batch.delete_key_prefix(self.context.base_key().bytes.clone());
             for (index, update) in mem::take(self.updates.get_mut()) {
                 if let Update::Set(mut view) = update {
                     view.flush(batch)?;
@@ -161,13 +158,8 @@ where
     }
 }
 
-impl<C, W> ClonableView<C> for ByteCollectionView<C, W>
-where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    W: ClonableView<C> + Send + Sync,
-{
-    fn clone_unchecked(&mut self) -> Result<Self, ViewError> {
+impl<W: ClonableView> ClonableView for ByteCollectionView<W::Context, W> {
+    fn clone_unchecked(&mut self) -> Self {
         let cloned_updates = self
             .updates
             .get_mut()
@@ -175,32 +167,31 @@ where
             .map(|(key, value)| {
                 let cloned_value = match value {
                     Update::Removed => Update::Removed,
-                    Update::Set(view) => Update::Set(view.clone_unchecked()?),
+                    Update::Set(view) => Update::Set(view.clone_unchecked()),
                 };
-                Ok((key.clone(), cloned_value))
+                (key.clone(), cloned_value)
             })
-            .collect::<Result<_, ViewError>>()?;
+            .collect();
 
-        Ok(ByteCollectionView {
+        ByteCollectionView {
             context: self.context.clone(),
             delete_storage_first: self.delete_storage_first,
             updates: RwLock::new(cloned_updates),
-        })
+        }
     }
 }
 
-impl<C, W> ByteCollectionView<C, W>
-where
-    C: Context + Send,
-    ViewError: From<C::Error>,
-    W: View<C>,
-{
+impl<W: View> ByteCollectionView<W::Context, W> {
     fn get_index_key(&self, index: &[u8]) -> Vec<u8> {
-        self.context.base_tag_index(KeyTag::Index as u8, index)
+        self.context
+            .base_key()
+            .base_tag_index(KeyTag::Index as u8, index)
     }
 
     fn get_subview_key(&self, index: &[u8]) -> Vec<u8> {
-        self.context.base_tag_index(KeyTag::Subview as u8, index)
+        self.context
+            .base_key()
+            .base_tag_index(KeyTag::Subview as u8, index)
     }
 
     fn add_index(&self, batch: &mut Batch, index: &[u8]) {
@@ -213,11 +204,11 @@ where
     /// can be modified.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::ByteCollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: ByteCollectionView<_, RegisterView<_, String>> =
     ///     ByteCollectionView::load(context).await.unwrap();
     /// let subview = view.load_entry_mut(&[0, 1]).await.unwrap();
@@ -234,11 +225,11 @@ where
     /// is read-only.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::ByteCollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: ByteCollectionView<_, RegisterView<_, String>> =
     ///     ByteCollectionView::load(context).await.unwrap();
     /// view.load_entry_mut(&[0, 1]).await.unwrap();
@@ -256,11 +247,11 @@ where
     /// May fail if one subview is already being visited.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::ByteCollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: ByteCollectionView<_, RegisterView<_, String>> =
     ///     ByteCollectionView::load(context).await.unwrap();
     /// {
@@ -297,10 +288,16 @@ where
                 }
             }
             btree_map::Entry::Vacant(entry) => {
-                let key_index = self.context.base_tag_index(KeyTag::Index as u8, short_key);
-                if !self.delete_storage_first && self.context.contains_key(&key_index).await? {
+                let key_index = self
+                    .context
+                    .base_key()
+                    .base_tag_index(KeyTag::Index as u8, short_key);
+                if !self.delete_storage_first
+                    && self.context.store().contains_key(&key_index).await?
+                {
                     let key = self
                         .context
+                        .base_key()
                         .base_tag_index(KeyTag::Subview as u8, short_key);
                     let context = self.context.clone_with_base_key(key);
                     let view = W::load(context).await?;
@@ -320,11 +317,11 @@ where
     /// Resets an entry to the default value.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::ByteCollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: ByteCollectionView<_, RegisterView<_, String>> =
     ///     ByteCollectionView::load(context).await.unwrap();
     /// let subview = view.load_entry_mut(&[0, 1]).await.unwrap();
@@ -339,6 +336,7 @@ where
     pub fn reset_entry_to_default(&mut self, short_key: &[u8]) -> Result<(), ViewError> {
         let key = self
             .context
+            .base_key()
             .base_tag_index(KeyTag::Subview as u8, short_key);
         let context = self.context.clone_with_base_key(key);
         let view = W::new(context)?;
@@ -351,11 +349,11 @@ where
     /// Tests if the collection contains a specified key and returns a boolean.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::ByteCollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: ByteCollectionView<_, RegisterView<_, String>> =
     ///     ByteCollectionView::load(context).await.unwrap();
     /// {
@@ -373,8 +371,11 @@ where
                 _entry @ Update::Removed => false,
             },
             None => {
-                let key_index = self.context.base_tag_index(KeyTag::Index as u8, short_key);
-                !self.delete_storage_first && self.context.contains_key(&key_index).await?
+                let key_index = self
+                    .context
+                    .base_key()
+                    .base_tag_index(KeyTag::Index as u8, short_key);
+                !self.delete_storage_first && self.context.store().contains_key(&key_index).await?
             }
         })
     }
@@ -382,11 +383,11 @@ where
     /// Marks the entry as removed. If absent then nothing is done.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::ByteCollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: ByteCollectionView<_, RegisterView<_, String>> =
     ///     ByteCollectionView::load(context).await.unwrap();
     /// let subview = view.load_entry_mut(&[0, 1]).await.unwrap();
@@ -407,7 +408,7 @@ where
     }
 
     /// Gets the extra data.
-    pub fn extra(&self) -> &C::Extra {
+    pub fn extra(&self) -> &<W::Context as Context>::Extra {
         self.context.extra()
     }
 
@@ -420,6 +421,7 @@ where
                     Update::Removed => {
                         let key = self
                             .context
+                            .base_key()
                             .base_tag_index(KeyTag::Subview as u8, short_key);
                         let context = self.context.clone_with_base_key(key);
                         // Obtain a view and set its pending state to the default (e.g. empty) state
@@ -435,6 +437,7 @@ where
             btree_map::Entry::Vacant(entry) => {
                 let key = self
                     .context
+                    .base_key()
                     .base_tag_index(KeyTag::Subview as u8, short_key);
                 let context = self.context.clone_with_base_key(key);
                 let view = if self.delete_storage_first {
@@ -451,22 +454,17 @@ where
     }
 }
 
-impl<C, W> ByteCollectionView<C, W>
-where
-    C: Context + Send,
-    ViewError: From<C::Error>,
-    W: View<C> + Sync,
-{
+impl<W: View> ByteCollectionView<W::Context, W> {
     /// Applies a function f on each index (aka key). Keys are visited in the
     /// lexicographic order. If the function returns false, then the loop
     /// ends prematurely.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::ByteCollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: ByteCollectionView<_, RegisterView<_, String>> =
     ///     ByteCollectionView::load(context).await.unwrap();
     /// view.load_entry_mut(&[0, 1]).await.unwrap();
@@ -490,23 +488,22 @@ where
         let mut update = updates.next();
         if !self.delete_storage_first {
             let base = self.get_index_key(&[]);
-            for index in self.context.find_keys_by_prefix(&base).await?.iterator() {
-                let index = index?;
+            for index in self.context.store().find_keys_by_prefix(&base).await? {
                 loop {
                     match update {
-                        Some((key, value)) if key.as_slice() <= index => {
+                        Some((key, value)) if key <= &index => {
                             if let Update::Set(_) = value {
                                 if !f(key)? {
                                     return Ok(());
                                 }
                             }
                             update = updates.next();
-                            if key == index {
+                            if key == &index {
                                 break;
                             }
                         }
                         _ => {
-                            if !f(index)? {
+                            if !f(&index)? {
                                 return Ok(());
                             }
                             break;
@@ -530,11 +527,11 @@ where
     /// lexicographic order.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::ByteCollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: ByteCollectionView<_, RegisterView<_, String>> =
     ///     ByteCollectionView::load(context).await.unwrap();
     /// view.load_entry_mut(&[0, 1]).await.unwrap();
@@ -563,11 +560,11 @@ where
     /// Returns the list of keys in the collection. The order is lexicographic.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::ByteCollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: ByteCollectionView<_, RegisterView<_, String>> =
     ///     ByteCollectionView::load(context).await.unwrap();
     /// view.load_entry_mut(&[0, 1]).await.unwrap();
@@ -589,11 +586,11 @@ where
     /// Returns the number of entries in the collection.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::ByteCollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: ByteCollectionView<_, RegisterView<_, String>> =
     ///     ByteCollectionView::load(context).await.unwrap();
     /// view.load_entry_mut(&[0, 1]).await.unwrap();
@@ -612,18 +609,12 @@ where
     }
 }
 
-#[async_trait]
-impl<C, W> HashableView<C> for ByteCollectionView<C, W>
-where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    W: HashableView<C> + Send + Sync + 'static,
-{
+impl<W: HashableView> HashableView for ByteCollectionView<W::Context, W> {
     type Hasher = sha3::Sha3_256;
 
     async fn hash_mut(&mut self) -> Result<<Self::Hasher as Hasher>::Output, ViewError> {
         #[cfg(with_metrics)]
-        let _hash_latency = COLLECTION_VIEW_HASH_RUNTIME.measure_latency();
+        let _hash_latency = metrics::COLLECTION_VIEW_HASH_RUNTIME.measure_latency();
         let mut hasher = sha3::Sha3_256::default();
         let keys = self.keys().await?;
         let count = keys.len() as u32;
@@ -639,7 +630,10 @@ where
                     view.hash_mut().await?
                 }
                 None => {
-                    let key = self.context.base_tag_index(KeyTag::Subview as u8, &key);
+                    let key = self
+                        .context
+                        .base_key()
+                        .base_tag_index(KeyTag::Subview as u8, &key);
                     let context = self.context.clone_with_base_key(key);
                     let mut view = W::load(context).await?;
                     view.hash_mut().await?
@@ -652,7 +646,7 @@ where
 
     async fn hash(&self) -> Result<<Self::Hasher as Hasher>::Output, ViewError> {
         #[cfg(with_metrics)]
-        let _hash_latency = COLLECTION_VIEW_HASH_RUNTIME.measure_latency();
+        let _hash_latency = metrics::COLLECTION_VIEW_HASH_RUNTIME.measure_latency();
         let mut hasher = sha3::Sha3_256::default();
         let keys = self.keys().await?;
         let count = keys.len() as u32;
@@ -668,7 +662,10 @@ where
                     view.hash().await?
                 }
                 None => {
-                    let key = self.context.base_tag_index(KeyTag::Subview as u8, &key);
+                    let key = self
+                        .context
+                        .base_key()
+                        .base_tag_index(KeyTag::Subview as u8, &key);
                     let context = self.context.clone_with_base_key(key);
                     let view = W::load(context).await?;
                     view.hash().await?
@@ -688,25 +685,23 @@ pub struct CollectionView<C, I, W> {
     _phantom: PhantomData<I>,
 }
 
-#[async_trait]
-impl<C, I, W> View<C> for CollectionView<C, I, W>
+impl<W: View, I> View for CollectionView<W::Context, I, W>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
     I: Send + Sync + Serialize + DeserializeOwned,
-    W: View<C> + Send + Sync,
 {
-    const NUM_INIT_KEYS: usize = ByteCollectionView::<C, W>::NUM_INIT_KEYS;
+    const NUM_INIT_KEYS: usize = ByteCollectionView::<W::Context, W>::NUM_INIT_KEYS;
 
-    fn context(&self) -> &C {
+    type Context = W::Context;
+
+    fn context(&self) -> &Self::Context {
         self.collection.context()
     }
 
-    fn pre_load(context: &C) -> Result<Vec<Vec<u8>>, ViewError> {
-        ByteCollectionView::<C, W>::pre_load(context)
+    fn pre_load(context: &Self::Context) -> Result<Vec<Vec<u8>>, ViewError> {
+        ByteCollectionView::<W::Context, W>::pre_load(context)
     }
 
-    fn post_load(context: C, values: &[Option<Vec<u8>>]) -> Result<Self, ViewError> {
+    fn post_load(context: Self::Context, values: &[Option<Vec<u8>>]) -> Result<Self, ViewError> {
         let collection = ByteCollectionView::post_load(context, values)?;
         Ok(CollectionView {
             collection,
@@ -714,7 +709,7 @@ where
         })
     }
 
-    async fn load(context: C) -> Result<Self, ViewError> {
+    async fn load(context: Self::Context) -> Result<Self, ViewError> {
         Self::post_load(context, &[])
     }
 
@@ -735,38 +730,29 @@ where
     }
 }
 
-impl<C, I, W> ClonableView<C> for CollectionView<C, I, W>
+impl<I, W: ClonableView> ClonableView for CollectionView<W::Context, I, W>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
     I: Send + Sync + Serialize + DeserializeOwned,
-    W: ClonableView<C> + Send + Sync,
 {
-    fn clone_unchecked(&mut self) -> Result<Self, ViewError> {
-        Ok(CollectionView {
-            collection: self.collection.clone_unchecked()?,
+    fn clone_unchecked(&mut self) -> Self {
+        CollectionView {
+            collection: self.collection.clone_unchecked(),
             _phantom: PhantomData,
-        })
+        }
     }
 }
 
-impl<C, I, W> CollectionView<C, I, W>
-where
-    C: Context + Send,
-    ViewError: From<C::Error>,
-    I: Serialize,
-    W: View<C>,
-{
+impl<I: Serialize, W: View> CollectionView<W::Context, I, W> {
     /// Loads a subview for the data at the given index in the collection. If an entry
     /// is absent then a default entry is added to the collection. The resulting view
     /// can be modified.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::CollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: CollectionView<_, u64, RegisterView<_, String>> =
     ///     CollectionView::load(context).await.unwrap();
     /// let subview = view.load_entry_mut(&23).await.unwrap();
@@ -779,7 +765,7 @@ where
         I: Borrow<Q>,
         Q: Serialize + ?Sized,
     {
-        let short_key = C::derive_short_key(index)?;
+        let short_key = BaseKey::derive_short_key(index)?;
         self.collection.load_entry_mut(&short_key).await
     }
 
@@ -788,11 +774,11 @@ where
     /// is read-only.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::CollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: CollectionView<_, u64, RegisterView<_, String>> =
     ///     CollectionView::load(context).await.unwrap();
     /// view.load_entry_mut(&23).await.unwrap();
@@ -806,7 +792,7 @@ where
         I: Borrow<Q>,
         Q: Serialize + ?Sized,
     {
-        let short_key = C::derive_short_key(index)?;
+        let short_key = BaseKey::derive_short_key(index)?;
         self.collection.load_entry_or_insert(&short_key).await
     }
 
@@ -815,11 +801,11 @@ where
     /// May fail if one subview is already being visited.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::CollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: CollectionView<_, u64, RegisterView<_, String>> =
     ///     CollectionView::load(context).await.unwrap();
     /// {
@@ -841,18 +827,18 @@ where
         I: Borrow<Q>,
         Q: Serialize + ?Sized,
     {
-        let short_key = C::derive_short_key(index)?;
+        let short_key = BaseKey::derive_short_key(index)?;
         self.collection.try_load_entry(&short_key).await
     }
 
     /// Resets an entry to the default value.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::CollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: CollectionView<_, u64, RegisterView<_, String>> =
     ///     CollectionView::load(context).await.unwrap();
     /// let subview = view.load_entry_mut(&23).await.unwrap();
@@ -869,18 +855,18 @@ where
         I: Borrow<Q>,
         Q: Serialize + ?Sized,
     {
-        let short_key = C::derive_short_key(index)?;
+        let short_key = BaseKey::derive_short_key(index)?;
         self.collection.reset_entry_to_default(&short_key)
     }
 
-    /// Removes an entry from the CollectionView. If absent nothing happens.
+    /// Removes an entry from the `CollectionView`. If absent nothing happens.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::CollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: CollectionView<_, u64, RegisterView<_, String>> =
     ///     CollectionView::load(context).await.unwrap();
     /// let subview = view.load_entry_mut(&23).await.unwrap();
@@ -896,33 +882,30 @@ where
         I: Borrow<Q>,
         Q: Serialize + ?Sized,
     {
-        let short_key = C::derive_short_key(index)?;
+        let short_key = BaseKey::derive_short_key(index)?;
         self.collection.remove_entry(short_key);
         Ok(())
     }
 
     /// Gets the extra data.
-    pub fn extra(&self) -> &C::Extra {
+    pub fn extra(&self) -> &<W::Context as Context>::Extra {
         self.collection.extra()
     }
 }
 
-impl<C, I, W> CollectionView<C, I, W>
+impl<I, W: View> CollectionView<W::Context, I, W>
 where
-    C: Context + Send,
-    ViewError: From<C::Error>,
     I: Sync + Clone + Send + Serialize + DeserializeOwned,
-    W: View<C> + Sync,
 {
     /// Returns the list of indices in the collection in the order determined by
     /// the serialization.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::CollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: CollectionView<_, u64, RegisterView<_, String>> =
     ///     CollectionView::load(context).await.unwrap();
     /// view.load_entry_mut(&23).await.unwrap();
@@ -944,11 +927,11 @@ where
     /// Returns the number of entries in the collection.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::CollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: CollectionView<_, u64, RegisterView<_, String>> =
     ///     CollectionView::load(context).await.unwrap();
     /// view.load_entry_mut(&23).await.unwrap();
@@ -961,23 +944,17 @@ where
     }
 }
 
-impl<C, I, W> CollectionView<C, I, W>
-where
-    C: Context + Send,
-    ViewError: From<C::Error>,
-    I: DeserializeOwned,
-    W: View<C> + Sync,
-{
+impl<I: DeserializeOwned, W: View> CollectionView<W::Context, I, W> {
     /// Applies a function f on each index. Indices are visited in an order
     /// determined by the serialization. If the function returns false then
     /// the loop ends prematurely.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::CollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: CollectionView<_, u64, RegisterView<_, String>> =
     ///     CollectionView::load(context).await.unwrap();
     /// view.load_entry_mut(&23).await.unwrap();
@@ -998,7 +975,7 @@ where
     {
         self.collection
             .for_each_key_while(|key| {
-                let index = C::deserialize_value(key)?;
+                let index = BaseKey::deserialize_value(key)?;
                 f(index)
             })
             .await?;
@@ -1009,11 +986,11 @@ where
     /// determined by the serialization.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::CollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: CollectionView<_, u64, RegisterView<_, String>> =
     ///     CollectionView::load(context).await.unwrap();
     /// view.load_entry_mut(&23).await.unwrap();
@@ -1034,7 +1011,7 @@ where
     {
         self.collection
             .for_each_key(|key| {
-                let index = C::deserialize_value(key)?;
+                let index = BaseKey::deserialize_value(key)?;
                 f(index)
             })
             .await?;
@@ -1042,13 +1019,9 @@ where
     }
 }
 
-#[async_trait]
-impl<C, I, W> HashableView<C> for CollectionView<C, I, W>
+impl<I, W: HashableView> HashableView for CollectionView<W::Context, I, W>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
     I: Clone + Send + Sync + Serialize + DeserializeOwned,
-    W: HashableView<C> + Send + Sync + 'static,
 {
     type Hasher = sha3::Sha3_256;
 
@@ -1061,32 +1034,27 @@ where
     }
 }
 
-/// A MapView that serializes the indices.
+/// A map view that serializes the indices.
 #[derive(Debug)]
 pub struct CustomCollectionView<C, I, W> {
     collection: ByteCollectionView<C, W>,
     _phantom: PhantomData<I>,
 }
 
-#[async_trait]
-impl<C, I, W> View<C> for CustomCollectionView<C, I, W>
-where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    I: Send + Sync,
-    W: View<C> + Send + Sync,
-{
-    const NUM_INIT_KEYS: usize = ByteCollectionView::<C, W>::NUM_INIT_KEYS;
+impl<I: Send + Sync, W: View> View for CustomCollectionView<W::Context, I, W> {
+    const NUM_INIT_KEYS: usize = ByteCollectionView::<W::Context, W>::NUM_INIT_KEYS;
 
-    fn context(&self) -> &C {
+    type Context = W::Context;
+
+    fn context(&self) -> &Self::Context {
         self.collection.context()
     }
 
-    fn pre_load(context: &C) -> Result<Vec<Vec<u8>>, ViewError> {
-        ByteCollectionView::<C, W>::pre_load(context)
+    fn pre_load(context: &Self::Context) -> Result<Vec<Vec<u8>>, ViewError> {
+        ByteCollectionView::<_, W>::pre_load(context)
     }
 
-    fn post_load(context: C, values: &[Option<Vec<u8>>]) -> Result<Self, ViewError> {
+    fn post_load(context: Self::Context, values: &[Option<Vec<u8>>]) -> Result<Self, ViewError> {
         let collection = ByteCollectionView::post_load(context, values)?;
         Ok(CustomCollectionView {
             collection,
@@ -1094,7 +1062,7 @@ where
         })
     }
 
-    async fn load(context: C) -> Result<Self, ViewError> {
+    async fn load(context: Self::Context) -> Result<Self, ViewError> {
         Self::post_load(context, &[])
     }
 
@@ -1115,38 +1083,26 @@ where
     }
 }
 
-impl<C, I, W> ClonableView<C> for CustomCollectionView<C, I, W>
-where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    I: Send + Sync,
-    W: ClonableView<C> + Send + Sync,
-{
-    fn clone_unchecked(&mut self) -> Result<Self, ViewError> {
-        Ok(CustomCollectionView {
-            collection: self.collection.clone_unchecked()?,
+impl<I: Send + Sync, W: ClonableView> ClonableView for CustomCollectionView<W::Context, I, W> {
+    fn clone_unchecked(&mut self) -> Self {
+        CustomCollectionView {
+            collection: self.collection.clone_unchecked(),
             _phantom: PhantomData,
-        })
+        }
     }
 }
 
-impl<C, I, W> CustomCollectionView<C, I, W>
-where
-    C: Context + Send,
-    ViewError: From<C::Error>,
-    I: CustomSerialize,
-    W: View<C>,
-{
+impl<I: CustomSerialize, W: View> CustomCollectionView<W::Context, I, W> {
     /// Loads a subview for the data at the given index in the collection. If an entry
     /// is absent then a default entry is added to the collection. The resulting view
     /// can be modified.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::CustomCollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: CustomCollectionView<_, u128, RegisterView<_, String>> =
     ///     CustomCollectionView::load(context).await.unwrap();
     /// let subview = view.load_entry_mut(&23).await.unwrap();
@@ -1168,11 +1124,11 @@ where
     /// is read-only.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::CustomCollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: CustomCollectionView<_, u128, RegisterView<_, String>> =
     ///     CustomCollectionView::load(context).await.unwrap();
     /// view.load_entry_mut(&23).await.unwrap();
@@ -1195,11 +1151,11 @@ where
     /// May fail if one subview is already being visited.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::CustomCollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: CustomCollectionView<_, u128, RegisterView<_, String>> =
     ///     CustomCollectionView::load(context).await.unwrap();
     /// {
@@ -1228,11 +1184,11 @@ where
     /// Marks the entry so that it is removed in the next flush.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::CustomCollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: CustomCollectionView<_, u128, RegisterView<_, String>> =
     ///     CustomCollectionView::load(context).await.unwrap();
     /// let subview = view.load_entry_mut(&23).await.unwrap();
@@ -1253,14 +1209,14 @@ where
         self.collection.reset_entry_to_default(&short_key)
     }
 
-    /// Removes an entry from the CollectionView. If absent nothing happens.
+    /// Removes an entry from the `CollectionView`. If absent nothing happens.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::CustomCollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: CustomCollectionView<_, u128, RegisterView<_, String>> =
     ///     CustomCollectionView::load(context).await.unwrap();
     /// let subview = view.load_entry_mut(&23).await.unwrap();
@@ -1282,26 +1238,20 @@ where
     }
 
     /// Gets the extra data.
-    pub fn extra(&self) -> &C::Extra {
+    pub fn extra(&self) -> &<W::Context as Context>::Extra {
         self.collection.extra()
     }
 }
 
-impl<C, I, W> CustomCollectionView<C, I, W>
-where
-    C: Context + Send,
-    ViewError: From<C::Error>,
-    I: Send + CustomSerialize,
-    W: View<C> + Sync,
-{
+impl<I: CustomSerialize + Send, W: View> CustomCollectionView<W::Context, I, W> {
     /// Returns the list of indices in the collection in the order determined by the custom serialization.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::CustomCollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: CustomCollectionView<_, u128, RegisterView<_, String>> =
     ///     CustomCollectionView::load(context).await.unwrap();
     /// view.load_entry_mut(&23).await.unwrap();
@@ -1323,11 +1273,11 @@ where
     /// Returns the number of entries in the collection.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::CollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: CollectionView<_, u64, RegisterView<_, String>> =
     ///     CollectionView::load(context).await.unwrap();
     /// view.load_entry_mut(&23).await.unwrap();
@@ -1340,23 +1290,17 @@ where
     }
 }
 
-impl<C, I, W> CustomCollectionView<C, I, W>
-where
-    C: Context + Send,
-    ViewError: From<C::Error>,
-    I: CustomSerialize,
-    W: View<C> + Sync,
-{
+impl<I: CustomSerialize, W: View> CustomCollectionView<W::Context, I, W> {
     /// Applies a function f on each index. Indices are visited in an order
     /// determined by the custom serialization. If the function f returns false,
     /// then the loop ends prematurely.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::CustomCollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: CustomCollectionView<_, u128, RegisterView<_, String>> =
     ///     CustomCollectionView::load(context).await.unwrap();
     /// view.load_entry_mut(&28).await.unwrap();
@@ -1389,11 +1333,11 @@ where
     /// determined by the custom serialization.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::{create_test_memory_context, MemoryContext};
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::collection_view::CustomCollectionView;
     /// # use linera_views::register_view::RegisterView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut view: CustomCollectionView<_, u128, RegisterView<_, String>> =
     ///     CustomCollectionView::load(context).await.unwrap();
     /// view.load_entry_mut(&28).await.unwrap();
@@ -1423,13 +1367,9 @@ where
     }
 }
 
-#[async_trait]
-impl<C, I, W> HashableView<C> for CustomCollectionView<C, I, W>
+impl<I, W: HashableView> HashableView for CustomCollectionView<W::Context, I, W>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    I: Clone + Send + Sync + CustomSerialize,
-    W: HashableView<C> + Send + Sync + 'static,
+    Self: View,
 {
     type Hasher = sha3::Sha3_256;
 
@@ -1454,19 +1394,17 @@ pub type HashedCollectionView<C, I, W> =
 pub type HashedCustomCollectionView<C, I, W> =
     WrappedHashableContainerView<C, CustomCollectionView<C, I, W>, HasherOutput>;
 
+#[cfg(with_graphql)]
 mod graphql {
     use std::borrow::Cow;
 
     use super::{CollectionView, CustomCollectionView, ReadGuardedView};
     use crate::{
-        context::Context,
         graphql::{hash_name, mangle, missing_key_error, Entry, MapFilters, MapInput},
         views::View,
     };
 
-    impl<'value, T: async_graphql::OutputType> async_graphql::OutputType
-        for ReadGuardedView<'value, T>
-    {
+    impl<T: async_graphql::OutputType> async_graphql::OutputType for ReadGuardedView<'_, T> {
         fn type_name() -> Cow<'static, str> {
             T::type_name()
         }
@@ -1499,16 +1437,15 @@ mod graphql {
     }
 
     #[async_graphql::Object(cache_control(no_cache), name_type)]
-    impl<C, K, V> CollectionView<C, K, V>
+    impl<K, V> CollectionView<V::Context, K, V>
     where
-        C: Send + Sync + Context,
         K: async_graphql::InputType
             + async_graphql::OutputType
             + serde::ser::Serialize
             + serde::de::DeserializeOwned
             + std::fmt::Debug
             + Clone,
-        V: View<C> + async_graphql::OutputType,
+        V: View + async_graphql::OutputType,
         MapInput<K>: async_graphql::InputType,
         MapFilters<K>: async_graphql::InputType,
     {
@@ -1553,7 +1490,7 @@ mod graphql {
         }
     }
 
-    impl<C: Send + Sync, K: async_graphql::OutputType, V: async_graphql::OutputType>
+    impl<C: Send + Sync, K: async_graphql::InputType, V: async_graphql::OutputType>
         async_graphql::TypeName for CustomCollectionView<C, K, V>
     {
         fn type_name() -> Cow<'static, str> {
@@ -1568,14 +1505,13 @@ mod graphql {
     }
 
     #[async_graphql::Object(cache_control(no_cache), name_type)]
-    impl<C, K, V> CustomCollectionView<C, K, V>
+    impl<K, V> CustomCollectionView<V::Context, K, V>
     where
-        C: Send + Sync + Context,
         K: async_graphql::InputType
             + async_graphql::OutputType
             + crate::common::CustomSerialize
             + std::fmt::Debug,
-        V: View<C> + async_graphql::OutputType,
+        V: View + async_graphql::OutputType,
         MapInput<K>: async_graphql::InputType,
         MapFilters<K>: async_graphql::InputType,
     {

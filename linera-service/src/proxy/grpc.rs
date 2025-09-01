@@ -3,10 +3,7 @@
 
 // `tracing::instrument` is not compatible with this nightly Clippy lint
 #![allow(unknown_lints)]
-#![allow(clippy::blocks_in_conditions)]
 
-#[cfg(with_metrics)]
-use std::sync::LazyLock;
 use std::{
     fmt::Debug,
     marker::PhantomData,
@@ -20,12 +17,15 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::{future::BoxFuture, FutureExt as _};
 use linera_base::identifiers::ChainId;
-use linera_client::config::GenesisConfig;
-use linera_core::{notifier::ChannelNotifier, JoinSetExt as _};
+use linera_core::{
+    data_types::{CertificatesByHeightRequest, ChainInfo, ChainInfoQuery},
+    notifier::ChannelNotifier,
+    JoinSetExt as _,
+};
+#[cfg(with_metrics)]
+use linera_metrics::prometheus_server;
 use linera_rpc::{
-    config::{
-        ShardConfig, TlsConfig, ValidatorInternalNetworkConfig, ValidatorPublicNetworkConfig,
-    },
+    config::{ProxyConfig, ShardConfig, TlsConfig, ValidatorInternalNetworkConfig},
     grpc::{
         api::{
             self,
@@ -33,8 +33,8 @@ use linera_rpc::{
             validator_node_server::{ValidatorNode, ValidatorNodeServer},
             validator_worker_client::ValidatorWorkerClient,
             BlobContent, BlobId, BlobIds, BlockProposal, Certificate, CertificatesBatchRequest,
-            CertificatesBatchResponse, ChainInfoQuery, ChainInfoResult, CryptoHash,
-            HandlePendingBlobRequest, LiteCertificate, Notification, PendingBlobRequest,
+            CertificatesBatchResponse, ChainInfoResult, CryptoHash, HandlePendingBlobRequest,
+            LiteCertificate, NetworkDescription, Notification, PendingBlobRequest,
             PendingBlobResult, SubscriptionRequest, VersionInfo,
         },
         pool::GrpcConnectionPool,
@@ -42,8 +42,8 @@ use linera_rpc::{
         GRPC_MAX_MESSAGE_SIZE,
     },
 };
-use linera_sdk::{base::Blob, views::ViewError};
-use linera_storage::Storage;
+use linera_sdk::{linera_base_types::Blob, views::ViewError};
+use linera_storage::{ResultReadCertificates, Storage};
 use prost::Message;
 use tokio::{select, task::JoinSet};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -54,48 +54,44 @@ use tonic::{
 };
 use tower::{builder::ServiceBuilder, Layer, Service};
 use tracing::{debug, info, instrument, Instrument as _, Level};
-#[cfg(with_metrics)]
-use {
-    linera_base::prometheus_util::{
-        bucket_latencies, register_histogram_vec, register_int_counter_vec,
-    },
-    prometheus::{HistogramVec, IntCounterVec},
-};
 
 #[cfg(with_metrics)]
-use crate::prometheus_server;
+mod metrics {
+    use std::sync::LazyLock;
 
-#[cfg(with_metrics)]
-static PROXY_REQUEST_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "proxy_request_latency",
-        "Proxy request latency",
-        &[],
-        bucket_latencies(500.0),
-    )
-});
+    use linera_base::prometheus_util::{
+        linear_bucket_interval, register_histogram_vec, register_int_counter_vec,
+    };
+    use prometheus::{HistogramVec, IntCounterVec};
 
-#[cfg(with_metrics)]
-static PROXY_REQUEST_COUNT: LazyLock<IntCounterVec> =
-    LazyLock::new(|| register_int_counter_vec("proxy_request_count", "Proxy request count", &[]));
+    pub static PROXY_REQUEST_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "proxy_request_latency",
+            "Proxy request latency",
+            &[],
+            linear_bucket_interval(1.0, 50.0, 2000.0),
+        )
+    });
+    pub static PROXY_REQUEST_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec("proxy_request_count", "Proxy request count", &[])
+    });
 
-#[cfg(with_metrics)]
-static PROXY_REQUEST_SUCCESS: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    register_int_counter_vec(
-        "proxy_request_success",
-        "Proxy request success",
-        &["method_name"],
-    )
-});
+    pub static PROXY_REQUEST_SUCCESS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec(
+            "proxy_request_success",
+            "Proxy request success",
+            &["method_name"],
+        )
+    });
 
-#[cfg(with_metrics)]
-static PROXY_REQUEST_ERROR: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    register_int_counter_vec(
-        "proxy_request_error",
-        "Proxy request error",
-        &["method_name"],
-    )
-});
+    pub static PROXY_REQUEST_ERROR: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec(
+            "proxy_request_error",
+            "Proxy request error",
+            &["method_name"],
+        )
+    });
+}
 
 #[derive(Clone)]
 pub struct PrometheusMetricsMiddlewareLayer;
@@ -134,10 +130,10 @@ where
             let response = future.await?;
             #[cfg(with_metrics)]
             {
-                PROXY_REQUEST_LATENCY
+                metrics::PROXY_REQUEST_LATENCY
                     .with_label_values(&[])
                     .observe(start.elapsed().as_secs_f64() * 1000.0);
-                PROXY_REQUEST_COUNT.with_label_values(&[]).inc();
+                metrics::PROXY_REQUEST_COUNT.with_label_values(&[]).inc();
             }
             Ok(response)
         }
@@ -149,13 +145,12 @@ where
 pub struct GrpcProxy<S>(Arc<GrpcProxyInner<S>>);
 
 struct GrpcProxyInner<S> {
-    public_config: ValidatorPublicNetworkConfig,
     internal_config: ValidatorInternalNetworkConfig,
-    genesis_config: GenesisConfig,
     worker_connection_pool: GrpcConnectionPool,
     notifier: ChannelNotifier<Result<Notification, Status>>,
     tls: TlsConfig,
     storage: S,
+    id: usize,
 }
 
 impl<S> GrpcProxy<S>
@@ -163,24 +158,22 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     pub fn new(
-        public_config: ValidatorPublicNetworkConfig,
         internal_config: ValidatorInternalNetworkConfig,
-        genesis_config: GenesisConfig,
         connect_timeout: Duration,
         timeout: Duration,
         tls: TlsConfig,
         storage: S,
+        id: usize,
     ) -> Self {
         Self(Arc::new(GrpcProxyInner {
-            public_config,
             internal_config,
-            genesis_config,
             worker_connection_pool: GrpcConnectionPool::default()
                 .with_connect_timeout(connect_timeout)
                 .with_timeout(timeout),
             notifier: ChannelNotifier::default(),
             tls,
             storage,
+            id,
         }))
     }
 
@@ -190,20 +183,28 @@ where
             .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
     }
 
+    fn config(&self) -> &ProxyConfig {
+        self.0
+            .internal_config
+            .proxies
+            .get(self.0.id)
+            .expect("No proxy config provided.")
+    }
+
     fn as_notifier_service(&self) -> NotifierServiceServer<Self> {
         NotifierServiceServer::new(self.clone())
     }
 
     fn public_address(&self) -> SocketAddr {
-        SocketAddr::from(([0, 0, 0, 0], self.0.public_config.port))
+        SocketAddr::from(([0, 0, 0, 0], self.config().public_port))
     }
 
     fn metrics_address(&self) -> SocketAddr {
-        SocketAddr::from(([0, 0, 0, 0], self.0.internal_config.metrics_port))
+        SocketAddr::from(([0, 0, 0, 0], self.config().metrics_port))
     }
 
     fn internal_address(&self) -> SocketAddr {
-        SocketAddr::from(([0, 0, 0, 0], self.0.internal_config.port))
+        SocketAddr::from(([0, 0, 0, 0], self.config().private_port))
     }
 
     fn shard_for(&self, proxyable: &impl GrpcProxyable) -> Option<ShardConfig> {
@@ -241,7 +242,7 @@ where
         err,
     )]
     pub async fn run(self, shutdown_signal: CancellationToken) -> Result<()> {
-        info!("Starting gRPC server");
+        info!("Starting proxy");
         let mut join_set = JoinSet::new();
 
         #[cfg(with_metrics)]
@@ -262,6 +263,9 @@ where
             .build_v1()?;
         let public_server = join_set.spawn_task(
             self.public_server()?
+                .max_concurrent_streams(Some(u32::MAX - 1)) // we subtract one to make sure
+                // that the value is not
+                // interpreted as "not set"
                 .layer(
                     ServiceBuilder::new()
                         .layer(PrometheusMetricsMiddlewareLayer)
@@ -314,6 +318,7 @@ where
         Ok((client, inner))
     }
 
+    #[allow(clippy::result_large_err)]
     fn log_and_return_proxy_request_outcome(
         result: Result<Response<ChainInfoResult>, Status>,
         method_name: &str,
@@ -322,25 +327,25 @@ where
         match result {
             Ok(chain_info_result) => {
                 #[cfg(with_metrics)]
-                PROXY_REQUEST_SUCCESS
+                metrics::PROXY_REQUEST_SUCCESS
                     .with_label_values(&[method_name])
                     .inc();
                 Ok(chain_info_result)
             }
             Err(status) => {
                 #[cfg(with_metrics)]
-                PROXY_REQUEST_ERROR.with_label_values(&[method_name]).inc();
+                metrics::PROXY_REQUEST_ERROR
+                    .with_label_values(&[method_name])
+                    .inc();
                 Err(status)
             }
         }
     }
 
     /// Returns the appropriate gRPC status for the given [`ViewError`].
-    fn error_to_status(err: ViewError) -> Status {
+    fn view_error_to_status(err: ViewError) -> Status {
         let mut status = match &err {
-            ViewError::TooLargeValue | ViewError::BcsError(_) => {
-                Status::invalid_argument(err.to_string())
-            }
+            ViewError::BcsError(_) => Status::invalid_argument(err.to_string()),
             ViewError::StoreError { .. }
             | ViewError::TokioJoinError(_)
             | ViewError::TryLockError(_)
@@ -351,7 +356,6 @@ where
                 Status::out_of_range(err.to_string())
             }
             ViewError::NotFound(_)
-            | ViewError::BlobsNotFound(_)
             | ViewError::CannotAcquireCollectionEntry
             | ViewError::MissingEntries => Status::not_found(err.to_string()),
         };
@@ -430,7 +434,7 @@ where
     #[instrument(skip_all, err(Display))]
     async fn handle_chain_info_query(
         &self,
-        request: Request<ChainInfoQuery>,
+        request: Request<api::ChainInfoQuery>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let (mut client, inner) = self.worker_client(request).await?;
         Self::log_and_return_proxy_request_outcome(
@@ -469,20 +473,28 @@ where
     }
 
     #[instrument(skip_all, err(Display))]
-    async fn get_genesis_config_hash(
+    async fn get_network_description(
         &self,
         _request: Request<()>,
-    ) -> Result<Response<CryptoHash>, Status> {
-        Ok(Response::new(self.0.genesis_config.hash().into()))
+    ) -> Result<Response<NetworkDescription>, Status> {
+        let description = self
+            .0
+            .storage
+            .read_network_description()
+            .await
+            .map_err(Self::view_error_to_status)?
+            .ok_or_else(|| Status::not_found("Cannot find network description in the database"))?;
+        Ok(Response::new(description.into()))
     }
 
     #[instrument(skip_all, err(Display))]
     async fn upload_blob(&self, request: Request<BlobContent>) -> Result<Response<BlobId>, Status> {
-        let content: linera_sdk::base::BlobContent = request.into_inner().try_into()?;
+        let content: linera_sdk::linera_base_types::BlobContent =
+            request.into_inner().try_into()?;
         let blob = Blob::new(content);
         let id = blob.id();
         let result = self.0.storage.maybe_write_blobs(&[blob]).await;
-        if !result.map_err(Self::error_to_status)?[0] {
+        if !result.map_err(Self::view_error_to_status)?[0] {
             return Err(Status::not_found("Blob not found"));
         }
         Ok(Response::new(id.try_into()?))
@@ -499,7 +511,8 @@ where
             .storage
             .read_blob(blob_id)
             .await
-            .map_err(Self::error_to_status)?;
+            .map_err(Self::view_error_to_status)?;
+        let blob = blob.ok_or_else(|| Status::not_found(format!("Blob not found {}", blob_id)))?;
         Ok(Response::new(blob.into_content().try_into()?))
     }
 
@@ -513,14 +526,14 @@ where
         match client.download_pending_blob(inner).await {
             Ok(blob_result) => {
                 #[cfg(with_metrics)]
-                PROXY_REQUEST_SUCCESS
+                metrics::PROXY_REQUEST_SUCCESS
                     .with_label_values(&["download_pending_blob"])
                     .inc();
                 Ok(blob_result)
             }
             Err(status) => {
                 #[cfg(with_metrics)]
-                PROXY_REQUEST_ERROR
+                metrics::PROXY_REQUEST_ERROR
                     .with_label_values(&["download_pending_blob"])
                     .inc();
                 Err(status)
@@ -538,14 +551,14 @@ where
         match client.handle_pending_blob(inner).await {
             Ok(blob_result) => {
                 #[cfg(with_metrics)]
-                PROXY_REQUEST_SUCCESS
+                metrics::PROXY_REQUEST_SUCCESS
                     .with_label_values(&["handle_pending_blob"])
                     .inc();
                 Ok(blob_result)
             }
             Err(status) => {
                 #[cfg(with_metrics)]
-                PROXY_REQUEST_ERROR
+                metrics::PROXY_REQUEST_ERROR
                     .with_label_values(&["handle_pending_blob"])
                     .inc();
                 Err(status)
@@ -564,7 +577,8 @@ where
             .storage
             .read_certificate(hash)
             .await
-            .map_err(Self::error_to_status)?
+            .map_err(Self::view_error_to_status)?
+            .ok_or(Status::not_found(hash.to_string()))?
             .into();
         Ok(Response::new(certificate.try_into()?))
     }
@@ -586,18 +600,24 @@ where
         let mut grpc_message_limiter: GrpcMessageLimiter<linera_chain::types::Certificate> =
             GrpcMessageLimiter::new(GRPC_CHUNKED_MESSAGE_FILL_LIMIT);
 
-        let mut certificates = vec![];
+        let mut returned_certificates = vec![];
 
         'outer: for batch in hashes.chunks(100) {
-            for certificate in self
+            let certificates = self
                 .0
                 .storage
                 .read_certificates(batch.to_vec())
                 .await
-                .map_err(Self::error_to_status)?
-            {
+                .map_err(Self::view_error_to_status)?;
+            let certificates = match ResultReadCertificates::new(certificates, batch.to_vec()) {
+                ResultReadCertificates::Certificates(certificates) => certificates,
+                ResultReadCertificates::InvalidHashes(hashes) => {
+                    return Err(Status::not_found(format!("{:?}", hashes)))
+                }
+            };
+            for certificate in certificates {
                 if grpc_message_limiter.fits::<Certificate>(certificate.clone().into())? {
-                    certificates.push(linera_chain::types::Certificate::from(certificate));
+                    returned_certificates.push(linera_chain::types::Certificate::from(certificate));
                 } else {
                     break 'outer;
                 }
@@ -605,8 +625,54 @@ where
         }
 
         Ok(Response::new(CertificatesBatchResponse::try_from(
-            certificates,
+            returned_certificates,
         )?))
+    }
+
+    #[instrument(skip_all, err(Display))]
+    async fn download_certificates_by_heights(
+        &self,
+        request: Request<api::DownloadCertificatesByHeightsRequest>,
+    ) -> Result<Response<CertificatesBatchResponse>, Status> {
+        let original_request: CertificatesByHeightRequest = request.into_inner().try_into()?;
+        let chain_info_request = ChainInfoQuery::new(original_request.chain_id)
+            .with_sent_certificate_hashes_by_heights(original_request.heights);
+
+        // Use handle_chain_info_query to get the certificate hashes
+        let chain_info_response = self
+            .handle_chain_info_query(Request::new(chain_info_request.try_into()?))
+            .await?;
+
+        // Extract the ChainInfoResult from the response
+        let chain_info_result = chain_info_response.into_inner();
+
+        // Extract the certificate hashes from the ChainInfo
+        let hashes = match chain_info_result.inner {
+            Some(api::chain_info_result::Inner::ChainInfoResponse(response)) => {
+                let chain_info: ChainInfo =
+                    bincode::deserialize(&response.chain_info).map_err(|e| {
+                        Status::internal(format!("Failed to deserialize ChainInfo: {}", e))
+                    })?;
+                chain_info.requested_sent_certificate_hashes
+            }
+            Some(api::chain_info_result::Inner::Error(error)) => {
+                return Err(Status::internal(format!(
+                    "Chain info query failed: {:?}",
+                    error
+                )));
+            }
+            None => {
+                return Err(Status::internal("Empty chain info result"));
+            }
+        };
+
+        // Use download_certificates to get the actual certificates
+        let certificates_request = CertificatesBatchRequest {
+            hashes: hashes.into_iter().map(|h| h.into()).collect(),
+        };
+
+        self.download_certificates(Request::new(certificates_request))
+            .await
     }
 
     #[instrument(skip_all, err(level = Level::WARN))]
@@ -620,8 +686,23 @@ where
             .storage
             .read_blob_state(blob_id)
             .await
-            .map_err(Self::error_to_status)?;
-        Ok(Response::new(blob_state.last_used_by.into()))
+            .map_err(Self::view_error_to_status)?;
+        let blob_state =
+            blob_state.ok_or_else(|| Status::not_found(format!("Blob not found {}", blob_id)))?;
+        let last_used_by = blob_state
+            .last_used_by
+            .ok_or_else(|| Status::not_found(format!("Blob not found {}", blob_id)))?;
+        Ok(Response::new(last_used_by.into()))
+    }
+
+    #[instrument(skip_all, err(level = Level::WARN))]
+    async fn blob_last_used_by_certificate(
+        &self,
+        request: Request<BlobId>,
+    ) -> Result<Response<Certificate>, Status> {
+        let cert_hash = self.blob_last_used_by(request).await?;
+        let request = Request::new(cert_hash.into_inner());
+        self.download_certificate(request).await
     }
 
     #[instrument(skip_all, err(level = Level::WARN))]
@@ -635,7 +716,7 @@ where
             .storage
             .missing_blobs(&blob_ids)
             .await
-            .map_err(Self::error_to_status)?;
+            .map_err(Self::view_error_to_status)?;
         Ok(Response::new(missing_blob_ids.try_into()?))
     }
 }
@@ -693,30 +774,28 @@ impl<T> GrpcMessageLimiter<T> {
 
 #[cfg(test)]
 mod proto_message_cap {
-    use linera_base::{
-        crypto::{KeyPair, Signature},
-        hashed::Hashed,
-    };
+    use linera_base::crypto::CryptoHash;
     use linera_chain::{
-        data_types::{BlockExecutionOutcome, ExecutedBlock},
-        types::{Certificate, ConfirmedBlock, ConfirmedBlockCertificate},
+        data_types::BlockExecutionOutcome,
+        types::{Block, Certificate, ConfirmedBlock, ConfirmedBlockCertificate},
     };
-    use linera_execution::committee::ValidatorName;
-    use linera_sdk::base::{ChainId, TestString};
+    use linera_sdk::linera_base_types::{
+        ChainId, TestString, ValidatorKeypair, ValidatorSignature,
+    };
 
     use super::{CertificatesBatchResponse, GrpcMessageLimiter};
 
     fn test_certificate() -> Certificate {
-        let keypair = KeyPair::generate();
-        let validator = ValidatorName(keypair.public());
-        let signature = Signature::new(&TestString::new("Test"), &keypair);
-        let executed_block = ExecutedBlock {
-            block: linera_chain::test::make_first_block(ChainId::root(0)),
-            outcome: BlockExecutionOutcome::default(),
-        };
+        let keypair = ValidatorKeypair::generate();
+        let validator = keypair.public_key;
+        let signature = ValidatorSignature::new(&TestString::new("Test"), &keypair.secret_key);
+        let block = Block::new(
+            linera_chain::test::make_first_block(ChainId(CryptoHash::test_hash("root_chain"))),
+            BlockExecutionOutcome::default(),
+        );
         let signatures = vec![(validator, signature)];
         Certificate::Confirmed(ConfirmedBlockCertificate::new(
-            Hashed::new(ConfirmedBlock::new(executed_block)),
+            ConfirmedBlock::new(block),
             Default::default(),
             signatures,
         ))

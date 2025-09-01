@@ -6,7 +6,7 @@
 
 use std::{
     borrow::Cow,
-    num::{NonZeroU16, NonZeroUsize},
+    num::NonZeroU16,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -14,26 +14,30 @@ use std::{
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use futures::{stream::FuturesUnordered, FutureExt as _, StreamExt, TryFutureExt as _};
-use linera_base::crypto::{CryptoRng, KeyPair};
-use linera_client::{
-    config::{CommitteeConfig, GenesisConfig, ValidatorConfig, ValidatorServerConfig},
-    persistent::{self, Persist},
-    storage::{full_initialize_storage, run_with_storage, Runnable, StorageConfigNamespace},
+use linera_base::{
+    crypto::{CryptoRng, Ed25519SecretKey},
+    listen_for_shutdown_signals,
 };
+use linera_client::config::{CommitteeConfig, ValidatorConfig, ValidatorServerConfig};
 use linera_core::{worker::WorkerState, JoinSetExt as _};
-use linera_execution::{committee::ValidatorName, WasmRuntime, WithWasmDefault};
+use linera_execution::{WasmRuntime, WithWasmDefault};
+#[cfg(with_metrics)]
+use linera_metrics::prometheus_server;
+use linera_persistent::{self as persistent, Persist};
 use linera_rpc::{
     config::{
-        CrossChainConfig, NetworkProtocol, NotificationConfig, ShardConfig, ShardId, TlsConfig,
-        ValidatorInternalNetworkConfig, ValidatorPublicNetworkConfig,
+        CrossChainConfig, ExporterServiceConfig, NetworkProtocol, NotificationConfig, ProxyConfig,
+        ShardConfig, ShardId, TlsConfig, ValidatorInternalNetworkConfig,
+        ValidatorPublicNetworkConfig,
     },
     grpc, simple,
 };
-#[cfg(with_metrics)]
-use linera_service::prometheus_server;
-use linera_service::util;
+use linera_sdk::linera_base_types::{AccountSecretKey, ValidatorKeypair};
+use linera_service::{
+    storage::{CommonStorageOptions, Runnable, StorageConfig},
+    util,
+};
 use linera_storage::Storage;
-use linera_views::store::CommonStoreConfig;
 use serde::Deserialize;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -45,7 +49,7 @@ struct ServerContext {
     notification_config: NotificationConfig,
     shard: Option<usize>,
     grace_period: Duration,
-    max_loaded_chains: NonZeroUsize,
+    chain_worker_ttl: Duration,
 }
 
 impl ServerContext {
@@ -60,15 +64,19 @@ impl ServerContext {
     {
         let shard = self.server_config.internal_network.shard(shard_id);
         info!("Shard booted on {}", shard.host);
+        info!(
+            "Public key: {}",
+            self.server_config.validator_secret.public()
+        );
         let state = WorkerState::new(
             format!("Shard {} @ {}:{}", shard_id, local_ip_addr, shard.port),
-            Some(self.server_config.key.copy()),
+            Some(self.server_config.validator_secret.copy()),
             storage,
-            self.max_loaded_chains,
         )
         .with_allow_inactive_chains(false)
         .with_allow_messages_from_deprecated_epochs(false)
-        .with_grace_period(self.grace_period);
+        .with_grace_period(self.grace_period)
+        .with_chain_worker_ttl(self.chain_worker_ttl);
         (state, shard_id, shard.clone())
     }
 
@@ -192,7 +200,7 @@ impl Runnable for ServerContext {
         let shutdown_notifier = CancellationToken::new();
         let listen_address = self.get_listen_address();
 
-        tokio::spawn(util::listen_for_shutdown_signals(shutdown_notifier.clone()));
+        tokio::spawn(listen_for_shutdown_signals(shutdown_notifier.clone()));
 
         // Run the server
         let states = match self.shard {
@@ -239,6 +247,10 @@ struct ServerOptions {
     /// The number of Tokio worker threads to use.
     #[arg(long, env = "LINERA_SERVER_TOKIO_THREADS")]
     tokio_threads: Option<usize>,
+
+    /// The number of Tokio blocking threads to use.
+    #[arg(long, env = "LINERA_SERVER_TOKIO_BLOCKING_THREADS")]
+    tokio_blocking_threads: Option<usize>,
 }
 
 #[derive(Debug, PartialEq, Eq, Deserialize)]
@@ -252,17 +264,9 @@ struct ValidatorOptions {
     /// The port of the validator
     port: u16,
 
-    /// The host for the metrics endpoint
-    metrics_host: String,
-
-    /// The port for the metrics endpoint
-    metrics_port: u16,
-
-    /// The host of the proxy in the internal network.
-    internal_host: String,
-
-    /// The port of the proxy on the internal network.
-    internal_port: u16,
+    /// The server configurations for the linera-exporter.
+    #[serde(default)]
+    block_exporters: Vec<ExporterServiceConfig>,
 
     /// The network protocol for the frontend.
     external_protocol: NetworkProtocol,
@@ -272,6 +276,9 @@ struct ValidatorOptions {
 
     /// The public name and the port of each of the shards
     shards: Vec<ShardConfig>,
+
+    /// The name and the port of the proxies
+    proxies: Vec<ProxyConfig>,
 }
 
 fn make_server_config<R: CryptoRng>(
@@ -279,28 +286,31 @@ fn make_server_config<R: CryptoRng>(
     rng: &mut R,
     options: ValidatorOptions,
 ) -> anyhow::Result<persistent::File<ValidatorServerConfig>> {
-    let key = KeyPair::generate_from(rng);
-    let name = ValidatorName(key.public());
+    let validator_keypair = ValidatorKeypair::generate_from(rng);
+    let account_secret = AccountSecretKey::Ed25519(Ed25519SecretKey::generate_from(rng));
+    let public_key = validator_keypair.public_key;
     let network = ValidatorPublicNetworkConfig {
         protocol: options.external_protocol,
         host: options.host,
         port: options.port,
     };
     let internal_network = ValidatorInternalNetworkConfig {
-        name,
+        public_key,
         protocol: options.internal_protocol,
         shards: options.shards,
-        host: options.internal_host,
-        port: options.internal_port,
-        metrics_host: options.metrics_host,
-        metrics_port: options.metrics_port,
+        block_exporters: options.block_exporters,
+        proxies: options.proxies,
     };
-    let validator = ValidatorConfig { network, name };
+    let validator = ValidatorConfig {
+        network,
+        public_key,
+        account_key: account_secret.public(),
+    };
     Ok(persistent::File::new(
         path,
         ValidatorServerConfig {
             validator,
-            key,
+            validator_secret: validator_keypair.secret_key,
             internal_network,
         },
     )?)
@@ -317,7 +327,11 @@ enum ServerCommand {
 
         /// Storage configuration for the blockchain history, chain states and binary blobs.
         #[arg(long = "storage")]
-        storage_config: StorageConfigNamespace,
+        storage_config: StorageConfig,
+
+        /// Common storage options.
+        #[command(flatten)]
+        common_storage_options: CommonStorageOptions,
 
         /// Configuration for cross-chain requests
         #[command(flatten)]
@@ -326,10 +340,6 @@ enum ServerCommand {
         /// Configuration for notifications
         #[command(flatten)]
         notification_config: NotificationConfig,
-
-        /// Path to the file describing the initial user chains (aka genesis state)
-        #[arg(long = "genesis")]
-        genesis_config_path: PathBuf,
 
         /// Runs a specific shard (from 0 to shards-1)
         #[arg(long)]
@@ -344,21 +354,13 @@ enum ServerCommand {
         #[arg(long)]
         wasm_runtime: Option<WasmRuntime>,
 
-        /// The maximal number of chains loaded in memory at a given time.
-        #[arg(long, default_value = "400")]
-        max_loaded_chains: NonZeroUsize,
-
-        /// The maximal number of simultaneous queries to the database
-        #[arg(long)]
-        max_concurrent_queries: Option<usize>,
-
-        /// The maximal number of stream queries to the database
-        #[arg(long, default_value = "10")]
-        max_stream_queries: usize,
-
-        /// The maximal number of entries in the storage cache.
-        #[arg(long, default_value = "1000")]
-        cache_size: usize,
+        /// The duration in milliseconds after which an idle chain worker will free its memory.
+        #[arg(
+            long = "chain-worker-ttl-ms",
+            default_value = "30000",
+            value_parser = util::parse_millis
+        )]
+        chain_worker_ttl: Duration,
     },
 
     /// Act as a trusted third-party and generate all server configurations
@@ -376,30 +378,6 @@ enum ServerCommand {
         /// TESTING ONLY.
         #[arg(long)]
         testing_prng_seed: Option<u64>,
-    },
-
-    /// Initialize the database
-    #[command(name = "initialize")]
-    Initialize {
-        /// Storage configuration for the blockchain history, chain states and binary blobs.
-        #[arg(long = "storage")]
-        storage_config: StorageConfigNamespace,
-
-        /// Path to the file describing the initial user chains (aka genesis state)
-        #[arg(long = "genesis")]
-        genesis_config_path: PathBuf,
-
-        /// The maximal number of simultaneous queries to the database
-        #[arg(long)]
-        max_concurrent_queries: Option<usize>,
-
-        /// The maximal number of stream queries to the database
-        #[arg(long, default_value = "10")]
-        max_stream_queries: usize,
-
-        /// The maximal number of entries in the storage cache.
-        #[arg(long, default_value = "1000")]
-        cache_size: usize,
     },
 
     /// Replaces the configurations of the shards by following the given template.
@@ -425,11 +403,6 @@ enum ServerCommand {
         #[arg(long)]
         port: String,
 
-        /// The host for the metrics endpoint, possibly containing `%` for digits of the
-        /// shard number.
-        #[arg(long)]
-        metrics_host: String,
-
         /// The port for the metrics endpoint, possibly containing `%` for digits of the
         /// shard number.
         #[arg(long)]
@@ -454,6 +427,10 @@ fn main() {
         builder
     };
 
+    if let Some(blocking_threads) = options.tokio_blocking_threads {
+        runtime.max_blocking_threads(blocking_threads);
+    }
+
     runtime
         .enable_all()
         .build()
@@ -471,18 +448,16 @@ fn log_file_name_for(command: &ServerCommand) -> Cow<'static, str> {
         } => {
             let server_config: ValidatorServerConfig =
                 util::read_json(server_config_path).expect("Failed to read server config");
-            let name = &server_config.validator.name;
+            let public_key = &server_config.validator.public_key;
 
             if let Some(shard) = shard {
-                format!("validator-{name}-shard-{shard}")
+                format!("validator-{public_key}-shard-{shard}")
             } else {
-                format!("validator-{name}")
+                format!("validator-{public_key}")
             }
             .into()
         }
-        ServerCommand::Generate { .. }
-        | ServerCommand::Initialize { .. }
-        | ServerCommand::EditShards { .. } => "server".into(),
+        ServerCommand::Generate { .. } | ServerCommand::EditShards { .. } => "server".into(),
     }
 }
 
@@ -491,30 +466,18 @@ async fn run(options: ServerOptions) {
         ServerCommand::Run {
             server_config_path,
             storage_config,
+            common_storage_options,
             cross_chain_config,
             notification_config,
-            genesis_config_path,
             shard,
             grace_period,
             wasm_runtime,
-            max_loaded_chains,
-            max_concurrent_queries,
-            max_stream_queries,
-            cache_size,
+            chain_worker_ttl,
         } => {
             linera_version::VERSION_INFO.log();
 
-            let genesis_config: GenesisConfig =
-                util::read_json(&genesis_config_path).expect("Failed to read initial chain config");
             let server_config: ValidatorServerConfig =
                 util::read_json(&server_config_path).expect("Failed to read server config");
-
-            #[cfg(feature = "rocksdb")]
-            if server_config.internal_network.shards.len() > 1
-                && storage_config.storage_config.is_rocks_db()
-            {
-                panic!("Multiple shards not supported with RocksDB");
-            }
 
             let job = ServerContext {
                 server_config,
@@ -522,19 +485,15 @@ async fn run(options: ServerOptions) {
                 notification_config,
                 shard,
                 grace_period,
-                max_loaded_chains,
+                chain_worker_ttl,
             };
             let wasm_runtime = wasm_runtime.with_wasm_default();
-            let common_config = CommonStoreConfig {
-                max_concurrent_queries,
-                max_stream_queries,
-                cache_size,
-            };
-            let full_storage_config = storage_config
-                .add_common_config(common_config)
+            let store_config = storage_config
+                .add_common_storage_options(&common_storage_options)
                 .await
                 .unwrap();
-            run_with_storage(full_storage_config, &genesis_config, wasm_runtime, job)
+            store_config
+                .run_with_storage(wasm_runtime, job)
                 .boxed()
                 .await
                 .unwrap()
@@ -553,7 +512,9 @@ async fn run(options: ServerOptions) {
                     .await
                     .expect("Unable to read validator options file");
                 let options: ValidatorOptions =
-                    toml::from_str(&options_string).expect("Invalid options file format");
+                    toml::from_str(&options_string).unwrap_or_else(|_| {
+                        panic!("Invalid options file format: \n {}", options_string)
+                    });
                 let path = options.server_config_path.clone();
                 let mut server = make_server_config(&path, &mut rng, options)
                     .expect("Unable to open server config file");
@@ -561,7 +522,10 @@ async fn run(options: ServerOptions) {
                     .await
                     .expect("Unable to write server config file");
                 info!("Wrote server config {}", path.to_str().unwrap());
-                println!("{}", server.validator.name);
+                println!(
+                    "{},{}",
+                    server.validator.public_key, server.validator.account_key
+                );
                 config_validators.push(Persist::into_value(server).validator);
             }
             if let Some(committee) = committee {
@@ -579,41 +543,17 @@ async fn run(options: ServerOptions) {
             }
         }
 
-        ServerCommand::Initialize {
-            storage_config,
-            genesis_config_path,
-            max_concurrent_queries,
-            max_stream_queries,
-            cache_size,
-        } => {
-            let genesis_config: GenesisConfig =
-                util::read_json(&genesis_config_path).expect("Failed to read initial chain config");
-            let common_config = CommonStoreConfig {
-                max_concurrent_queries,
-                max_stream_queries,
-                cache_size,
-            };
-            let full_storage_config = storage_config
-                .add_common_config(common_config)
-                .await
-                .unwrap();
-            full_initialize_storage(full_storage_config, &genesis_config)
-                .await
-                .unwrap();
-        }
-
         ServerCommand::EditShards {
             server_config_path,
             num_shards,
             host,
             port,
-            metrics_host,
             metrics_port,
         } => {
             let mut server_config =
                 persistent::File::<ValidatorServerConfig>::read(&server_config_path)
                     .expect("Failed to read server config");
-            let shards = generate_shard_configs(num_shards, host, port, metrics_host, metrics_port)
+            let shards = generate_shard_configs(num_shards, host, port, metrics_port)
                 .expect("Failed to generate shard configs");
             server_config.internal_network.shards = shards;
             Persist::persist(&mut server_config)
@@ -627,7 +567,6 @@ fn generate_shard_configs(
     num_shards: String,
     host: String,
     port: String,
-    metrics_host: String,
     metrics_port: Option<String>,
 ) -> anyhow::Result<Vec<ShardConfig>> {
     let mut shards = Vec::new();
@@ -644,7 +583,6 @@ fn generate_shard_configs(
             .replacen(&pattern, &index, 1)
             .parse()
             .context("Failed to decode port into an integers")?;
-        let metrics_host = metrics_host.replacen(&pattern, &index, 1);
         let metrics_port = metrics_port
             .as_ref()
             .map(|port| {
@@ -656,7 +594,6 @@ fn generate_shard_configs(
         let shard = ShardConfig {
             host,
             port,
-            metrics_host,
             metrics_port,
         };
         shards.push(shard);
@@ -676,24 +613,29 @@ mod test {
             server_config_path = "server.json"
             host = "host"
             port = 9000
-            internal_host = "internal_host"
-            internal_port = 10000
-            metrics_host = "metrics_host"
-            metrics_port = 5000
             external_protocol = { Simple = "Tcp" }
             internal_protocol = { Simple = "Udp" }
+
+            [[proxies]]
+            host = "proxy"
+            public_port = 20100
+            private_port = 20200
+            metrics_host = "proxy"
+            metrics_port = 21100
 
             [[shards]]
             host = "host1"
             port = 9001
-            metrics_host = "metrics_host1"
             metrics_port = 5001
 
             [[shards]]
             host = "host2"
             port = 9002
-            metrics_host = "metrics_host2"
             metrics_port = 5002
+
+            [[block_exporters]]
+            host = "exporter"
+            port = 12000
         "#;
         let options: ValidatorOptions = toml::from_str(toml_str).unwrap();
         assert_eq!(
@@ -704,21 +646,25 @@ mod test {
                 internal_protocol: NetworkProtocol::Simple(TransportProtocol::Udp),
                 host: "host".into(),
                 port: 9000,
-                internal_host: "internal_host".into(),
-                internal_port: 10000,
-                metrics_host: "metrics_host".into(),
-                metrics_port: 5000,
+                proxies: vec![ProxyConfig {
+                    host: "proxy".into(),
+                    public_port: 20100,
+                    private_port: 20200,
+                    metrics_port: 21100,
+                }],
+                block_exporters: vec![ExporterServiceConfig {
+                    host: "exporter".into(),
+                    port: 12000
+                }],
                 shards: vec![
                     ShardConfig {
                         host: "host1".into(),
                         port: 9001,
-                        metrics_host: "metrics_host1".into(),
                         metrics_port: Some(5001),
                     },
                     ShardConfig {
                         host: "host2".into(),
                         port: 9002,
-                        metrics_host: "metrics_host2".into(),
                         metrics_port: Some(5002),
                     },
                 ],
@@ -733,7 +679,6 @@ mod test {
                 "02".into(),
                 "host%%".into(),
                 "10%%".into(),
-                "metrics_host%%".into(),
                 Some("11%%".into())
             )
             .unwrap(),
@@ -741,13 +686,11 @@ mod test {
                 ShardConfig {
                     host: "host01".into(),
                     port: 1001,
-                    metrics_host: "metrics_host01".into(),
                     metrics_port: Some(1101),
                 },
                 ShardConfig {
                     host: "host02".into(),
                     port: 1002,
-                    metrics_host: "metrics_host02".into(),
                     metrics_port: Some(1102),
                 },
             ],
@@ -757,7 +700,6 @@ mod test {
             "2".into(),
             "host%%".into(),
             "10%%".into(),
-            "metrics_host%%".into(),
             Some("11%%".into())
         )
         .is_err());

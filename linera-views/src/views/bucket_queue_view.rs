@@ -2,35 +2,37 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{vec_deque::IterMut, VecDeque};
-#[cfg(with_metrics)]
-use std::sync::LazyLock;
 
-use async_trait::async_trait;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
 #[cfg(with_metrics)]
-use {
-    linera_base::prometheus_util::{bucket_latencies, register_histogram_vec, MeasureLatency},
-    prometheus::HistogramVec,
-};
+use linera_base::prometheus_util::MeasureLatency as _;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
     batch::Batch,
     common::{from_bytes_option, from_bytes_option_or_default, HasherOutput},
     context::Context,
     hashable_wrapper::WrappedHashableContainerView,
+    store::ReadableKeyValueStore as _,
     views::{ClonableView, HashableView, Hasher, View, ViewError, MIN_VIEW_TAG},
 };
 
 #[cfg(with_metrics)]
-/// The runtime of hash computation
-static BUCKET_QUEUE_VIEW_HASH_RUNTIME: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec(
-        "bucket_queue_view_hash_runtime",
-        "BucketQueueView hash runtime",
-        &[],
-        bucket_latencies(5.0),
-    )
-});
+mod metrics {
+    use std::sync::LazyLock;
+
+    use linera_base::prometheus_util::{exponential_bucket_latencies, register_histogram_vec};
+    use prometheus::HistogramVec;
+
+    /// The runtime of hash computation
+    pub static BUCKET_QUEUE_VIEW_HASH_RUNTIME: LazyLock<HistogramVec> = LazyLock::new(|| {
+        register_histogram_vec(
+            "bucket_queue_view_hash_runtime",
+            "BucketQueueView hash runtime",
+            &[],
+            exponential_bucket_latencies(5.0),
+        )
+    });
+}
 
 /// Key tags to create the sub-keys of a [`BucketQueueView`] on top of the base key.
 /// * The Front is special and downloaded at the view loading.
@@ -66,7 +68,7 @@ impl StoredIndices {
 
 /// The `Cursor` is the current position of the front in the queue.
 /// If position is None, then all the stored entries have been deleted
-/// and the new_back_values are the ones accessed by the front operation.
+/// and the `new_back_values` are the ones accessed by the front operation.
 /// If position is not trivial, then the first index is the relevant
 /// bucket for the front and the second index is the position in the index.
 #[derive(Clone, Debug)]
@@ -122,8 +124,9 @@ fn stored_indices<T>(stored_data: &VecDeque<(usize, Bucket<T>)>, position: usize
 
 /// A view that supports a FIFO queue for values of type `T`.
 /// The size `N` has to be chosen by taking into account the size of the type `T`
-/// and the basic size of a block. For example a total size of 100bytes to 10KB
+/// and the basic size of a block. For example a total size of 100 bytes to 10 KB
 /// seems adequate.
+#[derive(Debug)]
 pub struct BucketQueueView<C, T, const N: usize> {
     context: C,
     /// The buckets of stored data. If missing, then it has not been loaded. The first index is always loaded.
@@ -132,35 +135,35 @@ pub struct BucketQueueView<C, T, const N: usize> {
     new_back_values: VecDeque<T>,
     /// The stored position for the data
     stored_position: usize,
-    /// The current position in the stored_data.
+    /// The current position in the `stored_data`.
     cursor: Cursor,
     /// Whether the storage is deleted or not.
     delete_storage_first: bool,
 }
 
-#[async_trait]
-impl<C, T, const N: usize> View<C> for BucketQueueView<C, T, N>
+impl<C, T, const N: usize> View for BucketQueueView<C, T, N>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
+    C: Context,
     T: Send + Sync + Clone + Serialize + DeserializeOwned,
 {
     const NUM_INIT_KEYS: usize = 2;
+
+    type Context = C;
 
     fn context(&self) -> &C {
         &self.context
     }
 
     fn pre_load(context: &C) -> Result<Vec<Vec<u8>>, ViewError> {
-        let key1 = context.base_tag(KeyTag::Front as u8);
-        let key2 = context.base_tag(KeyTag::Store as u8);
+        let key1 = context.base_key().base_tag(KeyTag::Front as u8);
+        let key2 = context.base_key().base_tag(KeyTag::Store as u8);
         Ok(vec![key1, key2])
     }
 
     fn post_load(context: C, values: &[Option<Vec<u8>>]) -> Result<Self, ViewError> {
         let value1 = values.first().ok_or(ViewError::PostLoadValuesError)?;
         let value2 = values.get(1).ok_or(ViewError::PostLoadValuesError)?;
-        let front = from_bytes_option::<Vec<T>, _>(value1)?;
+        let front = from_bytes_option::<Vec<T>>(value1)?;
         let mut stored_data = VecDeque::from(match front {
             Some(front) => {
                 vec![(0, Bucket::Loaded { data: front })]
@@ -169,7 +172,7 @@ where
                 vec![]
             }
         });
-        let stored_indices = from_bytes_option_or_default::<StoredIndices, _>(value2)?;
+        let stored_indices = from_bytes_option_or_default::<StoredIndices>(value2)?;
         for i in 1..stored_indices.len() {
             let length = stored_indices.indices[i].0;
             let index = stored_indices.indices[i].1;
@@ -188,7 +191,7 @@ where
 
     async fn load(context: C) -> Result<Self, ViewError> {
         let keys = Self::pre_load(&context)?;
-        let values = context.read_multi_values_bytes(keys).await?;
+        let values = context.store().read_multi_values_bytes(keys).await?;
         Self::post_load(context, &values)
     }
 
@@ -216,12 +219,12 @@ where
     fn flush(&mut self, batch: &mut Batch) -> Result<bool, ViewError> {
         let mut delete_view = false;
         if self.delete_storage_first {
-            let key_prefix = self.context.base_key();
+            let key_prefix = self.context.base_key().bytes.clone();
             batch.delete_key_prefix(key_prefix);
             delete_view = true;
         }
         if self.stored_count() == 0 {
-            let key_prefix = self.context.base_key();
+            let key_prefix = self.context.base_key().bytes.clone();
             batch.delete_key_prefix(key_prefix);
             self.stored_data.clear();
             self.stored_position = 0;
@@ -277,7 +280,7 @@ where
         }
         if !self.delete_storage_first || !self.stored_data.is_empty() {
             let stored_indices = stored_indices(&self.stored_data, self.stored_position);
-            let key = self.context.base_tag(KeyTag::Store as u8);
+            let key = self.context.base_key().base_tag(KeyTag::Store as u8);
             batch.put_key_value(key, &stored_indices)?;
         }
         self.delete_storage_first = false;
@@ -291,45 +294,41 @@ where
     }
 }
 
-impl<C, T, const N: usize> ClonableView<C> for BucketQueueView<C, T, N>
+impl<C: Clone, T: Clone, const N: usize> ClonableView for BucketQueueView<C, T, N>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    T: Clone + Send + Sync + Serialize + DeserializeOwned,
+    Self: View,
 {
-    fn clone_unchecked(&mut self) -> Result<Self, ViewError> {
-        Ok(BucketQueueView {
+    fn clone_unchecked(&mut self) -> Self {
+        BucketQueueView {
             context: self.context.clone(),
             stored_data: self.stored_data.clone(),
             new_back_values: self.new_back_values.clone(),
             stored_position: self.stored_position,
             cursor: self.cursor.clone(),
             delete_storage_first: self.delete_storage_first,
-        })
+        }
     }
 }
 
-impl<C, T, const N: usize> BucketQueueView<C, T, N>
-where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-{
+impl<C: Context, T, const N: usize> BucketQueueView<C, T, N> {
     /// Gets the key corresponding to the index
     fn get_index_key(&self, index: usize) -> Result<Vec<u8>, ViewError> {
         Ok(if index == 0 {
-            self.context.base_tag(KeyTag::Front as u8)
+            self.context.base_key().base_tag(KeyTag::Front as u8)
         } else {
-            self.context.derive_tag_key(KeyTag::Index as u8, &index)?
+            self.context
+                .base_key()
+                .derive_tag_key(KeyTag::Index as u8, &index)?
         })
     }
 
     /// Gets the number of entries in the container that are stored
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::bucket_queue_view::BucketQueueView;
     /// # use crate::linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = BucketQueueView::<_, u8, 5>::load(context).await.unwrap();
     /// queue.push_back(34);
     /// assert_eq!(queue.stored_count(), 0);
@@ -354,10 +353,10 @@ where
     /// The total number of entries of the container
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::bucket_queue_view::BucketQueueView;
     /// # use crate::linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = BucketQueueView::<_, u8, 5>::load(context).await.unwrap();
     /// queue.push_back(34);
     /// assert_eq!(queue.count(), 1);
@@ -368,19 +367,14 @@ where
     }
 }
 
-impl<C, T, const N: usize> BucketQueueView<C, T, N>
-where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    T: Send + Sync + Clone + Serialize + DeserializeOwned,
-{
+impl<C: Context, T: DeserializeOwned + Clone, const N: usize> BucketQueueView<C, T, N> {
     /// Gets a reference on the front value if any.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::bucket_queue_view::BucketQueueView;
     /// # use crate::linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = BucketQueueView::<_, u8, 5>::load(context).await.unwrap();
     /// queue.push_back(34);
     /// queue.push_back(42);
@@ -403,10 +397,10 @@ where
     /// Reads the front value, if any.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::bucket_queue_view::BucketQueueView;
     /// # use crate::linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = BucketQueueView::<_, u8, 5>::load(context).await.unwrap();
     /// queue.push_back(34);
     /// queue.push_back(42);
@@ -431,10 +425,10 @@ where
     /// Deletes the front value, if any.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::bucket_queue_view::BucketQueueView;
     /// # use crate::linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = BucketQueueView::<_, u128, 5>::load(context).await.unwrap();
     /// queue.push_back(34 as u128);
     /// queue.delete_front().await.unwrap();
@@ -459,7 +453,7 @@ where
                     let index = *index;
                     if !bucket.is_loaded() {
                         let key = self.get_index_key(index)?;
-                        let value = self.context.read_value_bytes(&key).await?;
+                        let value = self.context.store().read_value_bytes(&key).await?;
                         let value = value.ok_or(ViewError::MissingEntries)?;
                         let data = bcs::from_bytes(&value)?;
                         self.stored_data[i_block].1 = Bucket::Loaded { data };
@@ -476,10 +470,10 @@ where
     /// Pushes a value to the end of the queue.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::bucket_queue_view::BucketQueueView;
     /// # use crate::linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = BucketQueueView::<_, u128, 5>::load(context).await.unwrap();
     /// queue.push_back(34);
     /// assert_eq!(queue.elements().await.unwrap(), vec![34]);
@@ -492,10 +486,10 @@ where
     /// Returns the list of elements in the queue.
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::bucket_queue_view::BucketQueueView;
     /// # use crate::linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = BucketQueueView::<_, u128, 5>::load(context).await.unwrap();
     /// queue.push_back(34);
     /// queue.push_back(37);
@@ -510,17 +504,20 @@ where
     /// Returns the last element of a bucket queue view
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::bucket_queue_view::BucketQueueView;
     /// # use crate::linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = BucketQueueView::<_, u128, 5>::load(context).await.unwrap();
     /// queue.push_back(34);
     /// queue.push_back(37);
     /// assert_eq!(queue.back().await.unwrap(), Some(37));
     /// # })
     /// ```
-    pub async fn back(&mut self) -> Result<Option<T>, ViewError> {
+    pub async fn back(&mut self) -> Result<Option<T>, ViewError>
+    where
+        T: Clone,
+    {
         if let Some(value) = self.new_back_values.back() {
             return Ok(Some(value.clone()));
         }
@@ -532,7 +529,7 @@ where
         };
         if !bucket.is_loaded() {
             let key = self.get_index_key(*index)?;
-            let value = self.context.read_value_bytes(&key).await?;
+            let value = self.context.store().read_value_bytes(&key).await?;
             let value = value.as_ref().ok_or(ViewError::MissingEntries)?;
             let data = bcs::from_bytes::<Vec<T>>(value)?;
             self.stored_data.back_mut().unwrap().1 = Bucket::Loaded { data };
@@ -570,7 +567,7 @@ where
                 count_remain -= size;
                 position = 0;
             }
-            let values = self.context.read_multi_values_bytes(keys).await?;
+            let values = self.context.store().read_multi_values_bytes(keys).await?;
             position = pair.1;
             let mut value_pos = 0;
             count_remain = count;
@@ -603,10 +600,10 @@ where
     /// Returns the first elements of a bucket queue view
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::bucket_queue_view::BucketQueueView;
     /// # use crate::linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = BucketQueueView::<_, u128, 5>::load(context).await.unwrap();
     /// queue.push_back(34);
     /// queue.push_back(37);
@@ -622,10 +619,10 @@ where
     /// Returns the last element of a bucket queue view
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::bucket_queue_view::BucketQueueView;
     /// # use crate::linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = BucketQueueView::<_, u128, 5>::load(context).await.unwrap();
     /// queue.push_back(34);
     /// queue.push_back(37);
@@ -677,10 +674,10 @@ where
     /// Gets a mutable iterator on the entries of the queue
     /// ```rust
     /// # tokio_test::block_on(async {
-    /// # use linera_views::context::create_test_memory_context;
+    /// # use linera_views::context::MemoryContext;
     /// # use linera_views::bucket_queue_view::BucketQueueView;
     /// # use linera_views::views::View;
-    /// # let context = create_test_memory_context();
+    /// # let context = MemoryContext::new_for_testing(());
     /// let mut queue = BucketQueueView::<_, u8, 5>::load(context).await.unwrap();
     /// queue.push_back(34);
     /// let mut iter = queue.iter_mut().await.unwrap();
@@ -695,12 +692,10 @@ where
     }
 }
 
-#[async_trait]
-impl<C, T, const N: usize> HashableView<C> for BucketQueueView<C, T, N>
+impl<C: Context, T: Serialize + DeserializeOwned + Send + Sync + Clone, const N: usize> HashableView
+    for BucketQueueView<C, T, N>
 where
-    C: Context + Send + Sync,
-    ViewError: From<C::Error>,
-    T: Send + Sync + Clone + Serialize + DeserializeOwned,
+    Self: View,
 {
     type Hasher = sha3::Sha3_256;
 
@@ -710,7 +705,7 @@ where
 
     async fn hash(&self) -> Result<<Self::Hasher as Hasher>::Output, ViewError> {
         #[cfg(with_metrics)]
-        let _hash_latency = BUCKET_QUEUE_VIEW_HASH_RUNTIME.measure_latency();
+        let _hash_latency = metrics::BUCKET_QUEUE_VIEW_HASH_RUNTIME.measure_latency();
         let elements = self.elements().await?;
         let mut hasher = sha3::Sha3_256::default();
         hasher.update_with_bcs_bytes(&elements)?;
@@ -722,6 +717,7 @@ where
 pub type HashedBucketQueueView<C, T, const N: usize> =
     WrappedHashableContainerView<C, BucketQueueView<C, T, N>, HasherOutput>;
 
+#[cfg(with_graphql)]
 mod graphql {
     use std::borrow::Cow;
 

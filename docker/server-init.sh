@@ -1,7 +1,10 @@
 #!/bin/sh
 
+storage=$1
+storage_replication_factor=$2
+
 while true; do
-  ./linera storage check_existence --storage "scylladb:tcp:scylla-client.scylla.svc.cluster.local:9042"
+  ./linera storage check-existence --storage $storage
   status=$?
 
   if [ $status -eq 0 ]; then
@@ -9,9 +12,10 @@ while true; do
     exit 0
   elif [ $status -eq 1 ]; then
     echo "Database does not exist, attempting to initialize..."
-    if ./linera-server initialize \
-      --storage scylladb:tcp:scylla-client.scylla.svc.cluster.local:9042 \
-      --genesis /config/genesis.json; then
+    if ./linera storage initialize \
+      --storage $storage \
+      --genesis /config/genesis.json \
+      --storage-replication-factor $storage_replication_factor; then
       echo "Initialization successful."
       exit 0
     else

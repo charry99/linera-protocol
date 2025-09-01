@@ -6,9 +6,9 @@
 mod state;
 use std::cmp::min;
 
-use fungible::{Account, FungibleTokenAbi};
+use fungible::FungibleTokenAbi;
 use linera_sdk::{
-    base::{AccountOwner, Amount, ApplicationId, ChainId, WithContractAbi},
+    linera_base_types::{Account, AccountOwner, Amount, ApplicationId, ChainId, WithContractAbi},
     views::{RootView, View},
     Contract, ContractRuntime,
 };
@@ -55,6 +55,7 @@ impl Contract for MatchingEngineContract {
     type Message = Message;
     type InstantiationArgument = ();
     type Parameters = Parameters;
+    type EventValue = ();
 
     async fn load(runtime: ContractRuntime<Self>) -> Self {
         let state = MatchingEngineState::load(runtime.root_view_storage_context())
@@ -77,7 +78,9 @@ impl Contract for MatchingEngineContract {
             Operation::ExecuteOrder { order } => {
                 let owner = Self::get_owner(&order);
                 let chain_id = self.runtime.chain_id();
-                self.check_account_authentication(owner);
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for ExecuteOrder operation");
                 if chain_id == self.runtime.application_creator_chain_id() {
                     self.execute_order_local(order, chain_id).await;
                 } else {
@@ -115,12 +118,13 @@ impl Contract for MatchingEngineContract {
         match message {
             Message::ExecuteOrder { order } => {
                 let owner = Self::get_owner(&order);
-                let message_id = self
-                    .runtime
-                    .message_id()
-                    .expect("Incoming message ID has to be available when executing a message");
-                self.check_account_authentication(owner);
-                self.execute_order_local(order, message_id.chain_id).await;
+                let origin_chain_id = self.runtime.message_origin_chain_id().expect(
+                    "Incoming message origin chain ID has to be available when executing a message",
+                );
+                self.runtime
+                    .check_account_permission(owner)
+                    .expect("Permission for ExecuteOrder message");
+                self.execute_order_local(order, origin_chain_id).await;
             }
         }
     }
@@ -149,26 +153,6 @@ impl MatchingEngineContract {
         }
     }
 
-    /// authenticate the originator of the message
-    fn check_account_authentication(&mut self, owner: AccountOwner) {
-        match owner {
-            AccountOwner::User(address) => {
-                assert_eq!(
-                    self.runtime.authenticated_signer(),
-                    Some(address),
-                    "Unauthorized"
-                )
-            }
-            AccountOwner::Application(id) => {
-                assert_eq!(
-                    self.runtime.authenticated_caller_id(),
-                    Some(id),
-                    "Unauthorized"
-                )
-            }
-        }
-    }
-
     /// The application engine is trading between two tokens. Those tokens are the parameters of the
     /// construction of the exchange and are accessed by index in the system.
     fn fungible_id(&mut self, token_idx: u32) -> ApplicationId<FungibleTokenAbi> {
@@ -185,7 +169,7 @@ impl MatchingEngineContract {
     ) {
         let destination = Account {
             chain_id: self.runtime.chain_id(),
-            owner: AccountOwner::Application(self.runtime.application_id().forget_abi()),
+            owner: self.runtime.application_id().into(),
         };
         let (amount, token_idx) = Self::get_amount_idx(nature, price, amount);
         self.transfer(*owner, amount, destination, token_idx)
@@ -194,7 +178,7 @@ impl MatchingEngineContract {
     /// Transfers `amount` tokens from the funds in custody to the `destination`.
     fn send_to(&mut self, transfer: Transfer) {
         let destination = transfer.account;
-        let owner_app = AccountOwner::Application(self.runtime.application_id().forget_abi());
+        let owner_app = self.runtime.application_id().into();
         self.transfer(owner_app, transfer.amount, destination, transfer.token_idx);
     }
 
@@ -206,7 +190,7 @@ impl MatchingEngineContract {
         target_account: Account,
         token_idx: u32,
     ) {
-        let transfer = fungible::Operation::Transfer {
+        let transfer = fungible::FungibleOperation::Transfer {
             owner,
             amount,
             target_account,
@@ -471,7 +455,7 @@ impl MatchingEngineContract {
         match nature {
             OrderNature::Bid => {
                 // The order offers to buy token1 at price price_insert
-                // * When the old order was created fill of token1 were commited
+                // * When the old order was created fill of token1 were committed
                 //   by the seller.
                 // * When the new order is created price_insert * fill of token0
                 //   were committed by the buyer.
@@ -496,9 +480,9 @@ impl MatchingEngineContract {
             OrderNature::Ask => {
                 // The order offers to sell token1 at price price_insert
                 // * When the old order was created, price_level * fill of token0
-                //   had to be commited by the buyer.
+                //   had to be committed by the buyer.
                 // * When the new order is created, fill of token1 have to
-                //   be commited by the seller.
+                //   be committed by the seller.
                 // The result is that
                 // * price_insert * fill have to be sent to the seller
                 // * the buyer receives

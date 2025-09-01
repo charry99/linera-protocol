@@ -3,16 +3,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     hash::Hash,
-    ops::Range,
+    mem,
 };
 
-use futures::{stream, stream::TryStreamExt, Future, StreamExt};
+use futures::{
+    stream::{FuturesUnordered, TryStreamExt},
+    Future, StreamExt,
+};
 use linera_base::{
+    crypto::ValidatorPublicKey,
     data_types::{BlockHeight, Round},
-    identifiers::{BlobId, ChainId},
+    ensure,
+    identifiers::{BlobId, ChainId, GenericApplicationId},
     time::{timer::timeout, Duration, Instant},
 };
 use linera_chain::{
@@ -20,7 +25,7 @@ use linera_chain::{
     types::{ConfirmedBlock, GenericCertificate, ValidatedBlock, ValidatedBlockCertificate},
 };
 use linera_execution::committee::Committee;
-use linera_storage::Storage;
+use linera_storage::{ResultReadCertificates, Storage};
 use thiserror::Error;
 
 use crate::{
@@ -42,10 +47,10 @@ const MAX_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 24); // 1 day.
 pub enum CommunicateAction {
     SubmitBlock {
         proposal: Box<BlockProposal>,
-        blob_ids: HashSet<BlobId>,
+        blob_ids: Vec<BlobId>,
     },
     FinalizeBlock {
-        certificate: ValidatedBlockCertificate,
+        certificate: Box<ValidatedBlockCertificate>,
         delivery: CrossChainMessageDelivery,
     },
     RequestTimeout {
@@ -71,7 +76,6 @@ pub struct ValidatorUpdater<A, S>
 where
     S: Storage,
 {
-    pub chain_worker_count: usize,
     pub remote_node: RemoteNode<A>,
     pub local_node: LocalNodeClient<S>,
 }
@@ -107,7 +111,7 @@ pub async fn communicate_with_quorum<'a, A, V, K, F, R, G>(
     execute: F,
     // Grace period as a fraction of time taken to reach quorum
     grace_period: f64,
-) -> Result<(K, Vec<V>), CommunicationError<NodeError>>
+) -> Result<(K, Vec<(ValidatorPublicKey, V)>), CommunicationError<NodeError>>
 where
     A: ValidatorNode + Clone + 'static,
     F: Clone + Fn(RemoteNode<A>) -> R,
@@ -119,14 +123,14 @@ where
     let mut responses: futures::stream::FuturesUnordered<_> = validator_clients
         .iter()
         .filter_map(|remote_node| {
-            if committee.weight(&remote_node.name) == 0 {
+            if committee.weight(&remote_node.public_key) == 0 {
                 // This should not happen but better prevent it because certificates
                 // are not allowed to include votes with weight 0.
                 return None;
             }
             let execute = execute.clone();
             let remote_node = remote_node.clone();
-            Some(async move { (remote_node.name, execute(remote_node).await) })
+            Some(async move { (remote_node.public_key, execute(remote_node).await) })
         })
         .collect();
 
@@ -134,7 +138,7 @@ where
     let mut end_time: Option<Instant> = None;
     let mut remaining_votes = committee.total_votes();
     let mut highest_key_score = 0;
-    let mut value_scores = HashMap::new();
+    let mut value_scores: HashMap<K, (u64, Vec<(ValidatorPublicKey, V)>)> = HashMap::new();
     let mut error_scores = HashMap::new();
 
     'vote_wait: while let Ok(Some((name, result))) = timeout(
@@ -149,7 +153,7 @@ where
                 let key = group_by(&value);
                 let entry = value_scores.entry(key.clone()).or_insert((0, Vec::new()));
                 entry.0 += committee.weight(&name);
-                entry.1.push(value);
+                entry.1.push((name, value));
                 highest_key_score = highest_key_score.max(entry.0);
             }
             Err(err) => {
@@ -229,7 +233,7 @@ where
                 // The certificate is confirmed, so the blobs must be in storage.
                 let maybe_blobs = self.local_node.read_blobs_from_storage(blob_ids).await?;
                 let blobs = maybe_blobs.ok_or_else(|| original_err.clone())?;
-                self.remote_node.upload_blobs(blobs.clone()).await?;
+                self.remote_node.node.upload_blobs(blobs.clone()).await?;
                 self.remote_node
                     .handle_confirmed_certificate(certificate, delivery)
                     .await
@@ -253,11 +257,11 @@ where
                 self.remote_node
                     .check_blobs_not_found(&certificate, blob_ids)?;
                 let chain_id = certificate.inner().chain_id();
-                // The certificate is for a validated block, i.e. for our locked block.
+                // The certificate is for a validated block, i.e. for our locking block.
                 // Take the missing blobs from our local chain manager.
                 let blobs = self
                     .local_node
-                    .get_locked_blobs(blob_ids, chain_id)
+                    .get_locking_blobs(blob_ids, chain_id)
                     .await?
                     .ok_or_else(|| original_err.clone())?;
                 self.remote_node.send_pending_blobs(chain_id, blobs).await?;
@@ -272,13 +276,11 @@ where
     async fn send_block_proposal(
         &mut self,
         proposal: Box<BlockProposal>,
-        mut blob_ids: HashSet<BlobId>,
+        mut blob_ids: Vec<BlobId>,
     ) -> Result<Box<ChainInfo>, ChainClientError> {
         let chain_id = proposal.content.block.chain_id;
         let mut sent_cross_chain_updates = false;
-        for blob in &proposal.blobs {
-            blob_ids.remove(&blob.id()); // Keep only blobs we may need to resend.
-        }
+        let mut publisher_chain_ids_sent = BTreeSet::new();
         loop {
             match self
                 .remote_node
@@ -286,24 +288,86 @@ where
                 .await
             {
                 Ok(info) => return Ok(info),
-                Err(NodeError::MissingCrossChainUpdate { .. })
-                | Err(NodeError::InactiveChain(_))
-                    if !sent_cross_chain_updates =>
-                {
+                Err(NodeError::WrongRound(_round)) => {
+                    // The proposal is for a different round, so we need to update the validator.
+                    // TODO: this should probably be more specific as to which rounds are retried.
+                    self.send_chain_information(
+                        chain_id,
+                        proposal.content.block.height,
+                        CrossChainMessageDelivery::NonBlocking,
+                    )
+                    .await?;
+                }
+                Err(NodeError::UnexpectedBlockHeight {
+                    expected_block_height,
+                    found_block_height,
+                }) if expected_block_height < found_block_height => {
+                    // The proposal is for a later block height, so we need to update the validator.
+                    self.send_chain_information(
+                        chain_id,
+                        found_block_height,
+                        CrossChainMessageDelivery::NonBlocking,
+                    )
+                    .await?;
+                }
+                Err(NodeError::MissingCrossChainUpdate { .. }) if !sent_cross_chain_updates => {
                     sent_cross_chain_updates = true;
                     // Some received certificates may be missing for this validator
                     // (e.g. to create the chain or make the balance sufficient) so we are going to
                     // synchronize them now and retry.
                     self.send_chain_information_for_senders(chain_id).await?;
                 }
-                Err(NodeError::BlobsNotFound(_)) if !blob_ids.is_empty() => {
+                Err(NodeError::EventsNotFound(event_ids)) => {
+                    let mut publisher_heights = BTreeMap::new();
+                    let new_chain_ids = event_ids
+                        .iter()
+                        .map(|event_id| event_id.chain_id)
+                        .filter(|chain_id| !publisher_chain_ids_sent.contains(chain_id))
+                        .collect::<BTreeSet<_>>();
+                    ensure!(
+                        !new_chain_ids.is_empty(),
+                        NodeError::EventsNotFound(event_ids)
+                    );
+                    for chain_id in new_chain_ids {
+                        let info = self.local_node.chain_info(chain_id).await?;
+                        publisher_heights.insert(chain_id, info.next_block_height);
+                        publisher_chain_ids_sent.insert(chain_id);
+                    }
+                    self.send_chain_info_up_to_heights(
+                        publisher_heights,
+                        CrossChainMessageDelivery::NonBlocking,
+                    )
+                    .await?;
+                }
+                Err(NodeError::BlobsNotFound(_) | NodeError::InactiveChain(_))
+                    if !blob_ids.is_empty() =>
+                {
                     // For `BlobsNotFound`, we assume that the local node should already be
                     // updated with the needed blobs, so sending the chain information about the
                     // certificates that last used the blobs to the validator node should be enough.
-                    let blob_ids = blob_ids.drain().collect::<Vec<_>>();
-                    let missing_blob_ids = self.remote_node.node.missing_blob_ids(blob_ids).await?;
-                    let local_storage = self.local_node.storage_client();
-                    let blob_states = local_storage.read_blob_states(&missing_blob_ids).await?;
+                    let published_blob_ids =
+                        BTreeSet::from_iter(proposal.content.block.published_blob_ids());
+                    blob_ids.retain(|blob_id| !published_blob_ids.contains(blob_id));
+                    let mut published_blobs = Vec::new();
+                    {
+                        let chain = self.local_node.chain_state_view(chain_id).await?;
+                        for blob_id in published_blob_ids {
+                            published_blobs
+                                .extend(chain.manager.proposed_blobs.get(&blob_id).await?);
+                        }
+                    }
+                    self.remote_node
+                        .send_pending_blobs(chain_id, published_blobs)
+                        .await?;
+                    let missing_blob_ids = self
+                        .remote_node
+                        .node
+                        .missing_blob_ids(mem::take(&mut blob_ids))
+                        .await?;
+                    let blob_states = self
+                        .local_node
+                        .read_blob_states_from_storage(&missing_blob_ids)
+                        .await?;
                     let mut chain_heights = BTreeMap::new();
                     for blob_state in blob_states {
                         let block_chain_id = blob_state.chain_id;
@@ -332,33 +396,80 @@ where
         target_block_height: BlockHeight,
         delivery: CrossChainMessageDelivery,
     ) -> Result<(), ChainClientError> {
-        // Figure out which certificates this validator is missing.
-        let query = ChainInfoQuery::new(chain_id);
-        let remote_info = self.remote_node.handle_chain_info_query(query).await?;
+        // Figure out which certificates this validator is missing. In many cases, it's just the
+        // last one, so we optimistically send that one right away.
+        let remote_info = if let Ok(height) = target_block_height.try_sub_one() {
+            let chain = self.local_node.chain_state_view(chain_id).await?;
+            if let Some(hash) = chain
+                .block_hashes(height..target_block_height)
+                .await?
+                .first()
+            {
+                let certificate = self
+                    .local_node
+                    .storage_client()
+                    .read_certificate(*hash)
+                    .await?
+                    .ok_or_else(|| ChainClientError::MissingConfirmedBlock(*hash))?;
+                match self.send_confirmed_certificate(certificate, delivery).await {
+                    Err(ChainClientError::RemoteNodeError(NodeError::EventsNotFound(
+                        event_ids,
+                    ))) if event_ids.iter().all(|event_id| {
+                        event_id.stream_id.application_id == GenericApplicationId::System
+                    }) =>
+                    {
+                        // The chain is missing epoch events. Send all blocks.
+                        let query = ChainInfoQuery::new(chain_id);
+                        self.remote_node.handle_chain_info_query(query).await?
+                    }
+                    Err(err) => return Err(err),
+                    Ok(info) => info,
+                }
+            } else {
+                // We don't have the block at the specified height. Send all blocks.
+                tracing::warn!(
+                    "send_chain_information called with height {target_block_height},
+                    but {chain_id:.8} does not have that block"
+                );
+                let query = ChainInfoQuery::new(chain_id);
+                self.remote_node.handle_chain_info_query(query).await?
+            }
+        } else {
+            let query = ChainInfoQuery::new(chain_id);
+            self.remote_node.handle_chain_info_query(query).await?
+        };
         let initial_block_height = remote_info.next_block_height;
         // Obtain the missing blocks and the manager state from the local node.
-        let range: Range<usize> =
-            initial_block_height.try_into()?..target_block_height.try_into()?;
-        let (keys, timeout) = {
+        let range = initial_block_height..target_block_height;
+        let keys = {
             let chain = self.local_node.chain_state_view(chain_id).await?;
-            (
-                chain.confirmed_log.read(range).await?,
-                chain.manager.timeout.get().clone(),
-            )
+            chain.block_hashes(range).await?
         };
         if !keys.is_empty() {
             // Send the requested certificates in order.
             let storage = self.local_node.storage_client();
-            let certs = storage.read_certificates(keys.into_iter()).await?;
-            for cert in certs {
-                self.send_confirmed_certificate(cert, delivery).await?;
+            let certificates = storage.read_certificates(keys.clone()).await?;
+            let certificates = match ResultReadCertificates::new(certificates, keys) {
+                ResultReadCertificates::Certificates(certificates) => certificates,
+                ResultReadCertificates::InvalidHashes(hashes) => {
+                    return Err(ChainClientError::ReadCertificatesError(hashes))
+                }
+            };
+            for certificate in certificates {
+                self.send_confirmed_certificate(certificate, delivery)
+                    .await?;
             }
         }
-        if let Some(cert) = timeout {
-            if cert.inner().chain_id == chain_id {
-                // Timeouts are small and don't have blobs, so we can call `handle_certificate`
-                // directly.
-                self.remote_node.handle_timeout_certificate(cert).await?;
+        // If the remote node is missing a timeout certificate, send it as well.
+        let local_info = self.local_node.chain_info(chain_id).await?;
+        if let Some(cert) = local_info.manager.timeout {
+            if (local_info.next_block_height, cert.round)
+                >= (
+                    remote_info.next_block_height,
+                    remote_info.manager.current_round,
+                )
+            {
+                self.remote_node.handle_timeout_certificate(*cert).await?;
             }
         }
         Ok(())
@@ -369,16 +480,15 @@ where
         chain_heights: BTreeMap<ChainId, BlockHeight>,
         delivery: CrossChainMessageDelivery,
     ) -> Result<(), ChainClientError> {
-        let stream = stream::iter(chain_heights)
-            .map(|(chain_id, height)| {
+        let stream =
+            FuturesUnordered::from_iter(chain_heights.into_iter().map(|(chain_id, height)| {
                 let mut updater = self.clone();
                 async move {
                     updater
                         .send_chain_information(chain_id, height, delivery)
                         .await
                 }
-            })
-            .buffer_unordered(self.chain_worker_count);
+            }));
         stream.try_collect::<Vec<_>>().await?;
         Ok(())
     }
@@ -394,7 +504,7 @@ where
             for (origin, inbox) in pairs {
                 let inbox_next_height = inbox.next_block_height_to_receive()?;
                 sender_heights
-                    .entry(origin.sender)
+                    .entry(origin)
                     .and_modify(|h| *h = inbox_next_height.max(*h))
                     .or_insert(inbox_next_height);
             }
@@ -409,50 +519,41 @@ where
         &mut self,
         action: CommunicateAction,
     ) -> Result<LiteVote, ChainClientError> {
-        let (target_block_height, chain_id) = match &action {
-            CommunicateAction::SubmitBlock { proposal, .. } => {
-                let block = &proposal.content.block;
-                (block.height, block.chain_id)
+        let chain_id = match &action {
+            CommunicateAction::SubmitBlock { proposal, .. } => proposal.content.block.chain_id,
+            CommunicateAction::FinalizeBlock { certificate, .. } => {
+                certificate.inner().block().header.chain_id
             }
-            CommunicateAction::FinalizeBlock { certificate, .. } => (
-                certificate.inner().block().header.height,
-                certificate.inner().block().header.chain_id,
-            ),
-            CommunicateAction::RequestTimeout {
-                height, chain_id, ..
-            } => (*height, *chain_id),
+            CommunicateAction::RequestTimeout { chain_id, .. } => *chain_id,
         };
-        // Update the validator with missing information, if needed.
-        let delivery = CrossChainMessageDelivery::NonBlocking;
-        self.send_chain_information(chain_id, target_block_height, delivery)
-            .await?;
         // Send the block proposal, certificate or timeout request and return a vote.
         let vote = match action {
             CommunicateAction::SubmitBlock { proposal, blob_ids } => {
                 let info = self.send_block_proposal(proposal, blob_ids).await?;
-                info.manager.pending
+                info.manager.pending.ok_or_else(|| {
+                    NodeError::MissingVoteInValidatorResponse("submit a block proposal".into())
+                })?
             }
             CommunicateAction::FinalizeBlock {
                 certificate,
                 delivery,
             } => {
                 let info = self
-                    .send_validated_certificate(certificate, delivery)
+                    .send_validated_certificate(*certificate, delivery)
                     .await?;
-                info.manager.pending
+                info.manager.pending.ok_or_else(|| {
+                    NodeError::MissingVoteInValidatorResponse("finalize a block".into())
+                })?
             }
-            CommunicateAction::RequestTimeout { .. } => {
-                let query = ChainInfoQuery::new(chain_id).with_timeout();
+            CommunicateAction::RequestTimeout { round, height, .. } => {
+                let query = ChainInfoQuery::new(chain_id).with_timeout(height, round);
                 let info = self.remote_node.handle_chain_info_query(query).await?;
-                info.manager.timeout_vote
+                info.manager.timeout_vote.ok_or_else(|| {
+                    NodeError::MissingVoteInValidatorResponse("request a timeout".into())
+                })?
             }
         };
-        match vote {
-            Some(vote) if vote.validator == self.remote_node.name => {
-                vote.check()?;
-                Ok(vote)
-            }
-            Some(_) | None => Err(NodeError::MissingVoteInValidatorResponse.into()),
-        }
+        vote.check(self.remote_node.public_key)?;
+        Ok(vote)
     }
 }

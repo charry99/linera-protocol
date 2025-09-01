@@ -16,16 +16,19 @@ use thiserror::Error;
 #[cfg(with_testing)]
 use super::mock_key_value_store::MockKeyValueStore;
 use crate::{
-    contract::wit::view_system_api::{self as contract_wit, WriteOperation},
-    service::wit::view_system_api as service_wit,
+    contract::wit::{
+        base_runtime_api::{self as contract_wit},
+        contract_runtime_api::{self, WriteOperation},
+    },
+    service::wit::base_runtime_api as service_wit,
     util::yield_once,
 };
 
 /// We need to have a maximum key size that handles all possible underlying
-/// sizes. The constraint so far is DynamoDb which has a key length of 1024.
+/// sizes. The constraint so far is DynamoDB which has a key length of 1024.
 /// That key length is decreased by 4 due to the use of a value splitting.
-/// Then the [`KeyValueStore`] needs to handle some base_key and so we
-/// reduce to 900. Depending on the size, the error can occur in system_api
+/// Then the [`KeyValueStore`] needs to handle some base key and so we
+/// reduce to 900. Depending on the size, the error can occur in `system_api`
 /// or in the `KeyValueStoreView`.
 const MAX_KEY_SIZE: usize = 900;
 
@@ -103,8 +106,6 @@ impl ReadableKeyValueStore for KeyValueStore {
     // The KeyValueStore of the system_api does not have limits
     // on the size of its values.
     const MAX_KEY_SIZE: usize = MAX_KEY_SIZE;
-    type Keys = Vec<Vec<u8>>;
-    type KeyValues = Vec<(Vec<u8>, Vec<u8>)>;
 
     fn max_stream_queries(&self) -> usize {
         1
@@ -160,7 +161,7 @@ impl ReadableKeyValueStore for KeyValueStore {
     async fn find_keys_by_prefix(
         &self,
         key_prefix: &[u8],
-    ) -> Result<Self::Keys, KeyValueStoreError> {
+    ) -> Result<Vec<Vec<u8>>, KeyValueStoreError> {
         ensure!(
             key_prefix.len() <= Self::MAX_KEY_SIZE,
             KeyValueStoreError::KeyTooLong
@@ -173,7 +174,7 @@ impl ReadableKeyValueStore for KeyValueStore {
     async fn find_key_values_by_prefix(
         &self,
         key_prefix: &[u8],
-    ) -> Result<Self::KeyValues, KeyValueStoreError> {
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, KeyValueStoreError> {
         ensure!(
             key_prefix.len() <= Self::MAX_KEY_SIZE,
             KeyValueStoreError::KeyTooLong
@@ -344,7 +345,7 @@ impl WitInterface {
                     .map(WriteOperation::from)
                     .collect::<Vec<_>>();
 
-                contract_wit::write_batch(&batch_operations);
+                contract_runtime_api::write_batch(&batch_operations);
             }
             WitInterface::Service => panic!("Attempt to modify storage from a service"),
             #[cfg(with_testing)]

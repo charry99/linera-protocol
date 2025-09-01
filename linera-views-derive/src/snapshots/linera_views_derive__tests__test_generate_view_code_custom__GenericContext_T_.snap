@@ -2,28 +2,41 @@
 source: linera-views-derive/src/lib.rs
 expression: "pretty(generate_view_code(input, true))"
 ---
-#[linera_views::async_trait]
-impl linera_views::views::View<custom::GenericContext<T>> for TestView {
-    const NUM_INIT_KEYS: usize = RegisterView::<
+impl linera_views::views::View for TestView
+where
+    custom::GenericContext<T>: linera_views::context::Context,
+    RegisterView<
         custom::GenericContext<T>,
         usize,
-    >::NUM_INIT_KEYS
-        + CollectionView::<
+    >: linera_views::views::View<Context = custom::GenericContext<T>>,
+    CollectionView<
+        custom::GenericContext<T>,
+        usize,
+        RegisterView<custom::GenericContext<T>, usize>,
+    >: linera_views::views::View<Context = custom::GenericContext<T>>,
+{
+    const NUM_INIT_KEYS: usize = <RegisterView<
+        custom::GenericContext<T>,
+        usize,
+    > as linera_views::views::View>::NUM_INIT_KEYS
+        + <CollectionView<
             custom::GenericContext<T>,
             usize,
             RegisterView<custom::GenericContext<T>, usize>,
-        >::NUM_INIT_KEYS;
+        > as linera_views::views::View>::NUM_INIT_KEYS;
+    type Context = custom::GenericContext<T>;
     fn context(&self) -> &custom::GenericContext<T> {
         use linera_views::views::View;
         self.register.context()
     }
     fn pre_load(
         context: &custom::GenericContext<T>,
-    ) -> Result<Vec<Vec<u8>>, linera_views::views::ViewError> {
+    ) -> Result<Vec<Vec<u8>>, linera_views::ViewError> {
         use linera_views::context::Context as _;
         let mut keys = Vec::new();
         let index = 0;
         let base_key = context
+            .base_key()
             .derive_tag_key(linera_views::views::MIN_VIEW_TAG, &index)?;
         keys.extend(
             RegisterView::<
@@ -33,6 +46,7 @@ impl linera_views::views::View<custom::GenericContext<T>> for TestView {
         );
         let index = 1;
         let base_key = context
+            .base_key()
             .derive_tag_key(linera_views::views::MIN_VIEW_TAG, &index)?;
         keys.extend(
             CollectionView::<
@@ -46,13 +60,14 @@ impl linera_views::views::View<custom::GenericContext<T>> for TestView {
     fn post_load(
         context: custom::GenericContext<T>,
         values: &[Option<Vec<u8>>],
-    ) -> Result<Self, linera_views::views::ViewError> {
+    ) -> Result<Self, linera_views::ViewError> {
         use linera_views::context::Context as _;
         let mut pos = 0;
         let index = 0;
         let pos_next = pos
             + RegisterView::<custom::GenericContext<T>, usize>::NUM_INIT_KEYS;
         let base_key = context
+            .base_key()
             .derive_tag_key(linera_views::views::MIN_VIEW_TAG, &index)?;
         let register = RegisterView::<
             custom::GenericContext<T>,
@@ -67,6 +82,7 @@ impl linera_views::views::View<custom::GenericContext<T>> for TestView {
                 RegisterView<custom::GenericContext<T>, usize>,
             >::NUM_INIT_KEYS;
         let base_key = context
+            .base_key()
             .derive_tag_key(linera_views::views::MIN_VIEW_TAG, &index)?;
         let collection = CollectionView::<
             custom::GenericContext<T>,
@@ -78,13 +94,13 @@ impl linera_views::views::View<custom::GenericContext<T>> for TestView {
     }
     async fn load(
         context: custom::GenericContext<T>,
-    ) -> Result<Self, linera_views::views::ViewError> {
-        use linera_views::context::Context as _;
+    ) -> Result<Self, linera_views::ViewError> {
+        use linera_views::{context::Context as _, store::ReadableKeyValueStore as _};
         if Self::NUM_INIT_KEYS == 0 {
             Self::post_load(context, &[])
         } else {
             let keys = Self::pre_load(&context)?;
-            let values = context.read_multi_values_bytes(keys).await?;
+            let values = context.store().read_multi_values_bytes(keys).await?;
             Self::post_load(context, &values)
         }
     }
@@ -104,7 +120,7 @@ impl linera_views::views::View<custom::GenericContext<T>> for TestView {
     fn flush(
         &mut self,
         batch: &mut linera_views::batch::Batch,
-    ) -> Result<bool, linera_views::views::ViewError> {
+    ) -> Result<bool, linera_views::ViewError> {
         use linera_views::views::View;
         let deleted0 = self.register.flush(batch)?;
         let deleted1 = self.collection.flush(batch)?;
